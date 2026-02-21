@@ -5,9 +5,6 @@ edition = "2024"
 authors = ["Emma Davenport"]
 license = "AGPL-3.0"
 
-[dependencies]
-windows = "0.62.2"
-
 [lib]
 name = "swtor_chat_capture"
 path = "src/lib.rs"
@@ -17,13 +14,24 @@ crate-type = ["cdylib"]
 name = "chator-service"
 path = "src/main.rs"
 
+[dependencies]
 chrono = {version =  "0.4", features = ["serde"]}
 
 # Helpers
 int-enum = "1.1"
 
+# Misc
+thiserror = "2.0"
+microseh = "1.1"
+encoding_rs = "0.8"
+
 # Hashing
 sha2 = "0.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 
 # Logging
 tracing = "0.1"

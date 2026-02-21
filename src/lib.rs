@@ -32,12 +32,12 @@ static CHATOR_PORT: AtomicU16 = AtomicU16::new(0);
 // TcpListener port for this injected module
 static LOCAL_PORT: AtomicU16 = AtomicU16::new(0);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn capture_module_initalized() -> bool {
     CHATOR_PORT.load(Ordering::Relaxed) != 0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn get_module_ports() -> ModulePorts {
     ModulePorts::new(
         CHATOR_PORT.load(Ordering::Relaxed),
@@ -45,7 +45,7 @@ extern "system" fn get_module_ports() -> ModulePorts {
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn set_chator_port(port: u16) {
     CHATOR_PORT.store(port, Ordering::Relaxed);
 }
@@ -54,7 +54,7 @@ extern "system" fn set_chator_port(port: u16) {
     This function is called by the chator client to initialize the module.
     Returns the port that the module is listening on.
 */
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn init_capture_module(chator_port: u16) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
