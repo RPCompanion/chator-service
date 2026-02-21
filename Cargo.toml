@@ -8,7 +8,22 @@ license = "AGPL-3.0"
 [dependencies]
 windows = "0.62.2"
 
+[lib]
+name = "swtor_chat_capture"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "chator-service"
+path = "src/main.rs"
+
 chrono = {version =  "0.4", features = ["serde"]}
+
+# Helpers
+int-enum = "1.1"
+
+# Hashing
+sha2 = "0.10"
 
 # Logging
 tracing = "0.1"
@@ -19,3 +34,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctor = "0.2.8"
 dll-syringe = { version = "0.17.1", features = ["payload-utils"] }
 retour = { version = "0.4.0-alpha.3", features = ["static-detour"] }
+
+# Windows
+clipboard-win = "5.0.0"
+windows = { version = "0.52", features = [
+    "Data_Xml_Dom", 
+    "Win32_Foundation", 
+    "Win32_Security", 
+    "Win32_System_Memory",
+    "Win32_System_Threading", 
+    "Win32_System_LibraryLoader", 
+    "Win32_UI_WindowsAndMessaging", 
+    "Win32_UI_Input_KeyboardAndMouse", 
+    "Win32_System_ProcessStatus", 
+    "Win32_UI_WindowsAndMessaging"] }
