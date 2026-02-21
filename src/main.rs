@@ -2,6 +2,8 @@ use std::net::TcpStream;
 use std::thread;
 
 pub mod logging;
+pub mod swtor;
+pub mod swtor_hook;
 
 fn main() {
     let _guard = logging::init();
