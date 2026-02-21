@@ -147,18 +147,20 @@ fn start_quit_listener(listener: TcpListener) {
     });
 }
 
-unsafe fn begin_hook() {
-    match GetModuleHandleA(PCSTR(b"swtor.exe\0".as_ptr())) {
-        Ok(hmodule) => {
-            submit_message(CaptureMessage::Info("Found module".to_string()));
-            submit_message(CaptureMessage::Info(format!(
-                "Module handle: {:?}",
-                hmodule
-            )));
-            begin_detours(hmodule.0);
-        }
-        Err(_) => {
-            submit_message(CaptureMessage::Info("Failed to find module".to_string()));
+fn begin_hook() {
+    unsafe {
+        match GetModuleHandleA(PCSTR(b"swtor.exe\0".as_ptr())) {
+            Ok(hmodule) => {
+                submit_message(CaptureMessage::Info("Found module".to_string()));
+                submit_message(CaptureMessage::Info(format!(
+                    "Module handle: {:?}",
+                    hmodule
+                )));
+                begin_detours(hmodule.0);
+            }
+            Err(_) => {
+                submit_message(CaptureMessage::Info("Failed to find module".to_string()));
+            }
         }
     }
 }
