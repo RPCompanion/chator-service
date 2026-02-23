@@ -1,0 +1,13 @@
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld"
+rustflags = [
+  "-Lnative=/home/edavenport/.xwin/crt/lib/x86_64",
+  "-Lnative=/home/edavenport/.xwin/sdk/lib/um/x86_64",
+  "-Lnative=/home/edavenport/.xwin/sdk/lib/ucrt/x86_64"
+]
+
+[env]
+CC_x86_64_pc_windows_msvc = "clang-cl"
+AR_x86_64_pc_windows_msvc = "llvm-lib"
+CFLAGS_x86_64_pc_windows_msvc = "-Wno-unused-command-line-argument --target=x86_64-pc-windows-msvc /imsvc/home/edavenport/.xwin/crt/include /imsvc/home/edavenport/.xwin/sdk/include/um /imsvc/home/edavenport/.xwin/sdk/include/shared /imsvc/home/edavenport/.xwin/sdk/include/ucrt"

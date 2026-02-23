@@ -80,9 +80,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chator-macros"
+version = "0.1.0"
+source = "git+https://github.com/RPCompanion/chator-macros#2a077eb27c2458e4355f83c7f525fb8e1aaa7cb1"
+dependencies = [
+ "quote",
+ "syn 2.0.116",
+]
+
+[[package]]
 name = "chator-service"
 version = "0.1.0"
 dependencies = [
+ "chator-macros",
  "chrono",
  "clipboard-win",
  "ctor",

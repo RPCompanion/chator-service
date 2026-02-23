@@ -1,6 +1,8 @@
 use std::net::TcpStream;
 use std::thread;
 
+pub mod capture_injector;
+pub mod comms;
 pub mod logging;
 pub mod swtor;
 pub mod swtor_hook;

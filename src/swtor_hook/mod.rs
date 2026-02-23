@@ -10,20 +10,20 @@ use std::time::Duration;
 
 use tracing::error;
 
-use serde_json::json;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, MAX_PATH};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_INFORMATION, QueryFullProcessImageNameW,
 };
+
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
 };
+
 use windows::core::PWSTR;
 
-use crate::dal::db::settings::get_settings;
+use crate::comms::{self, FromService};
 
 pub mod message_hash_container;
-pub mod post;
 
 static SWTOR_HWND: Mutex<Option<HWND>> = Mutex::new(None);
 static SWTOR_PID: Mutex<Option<u32>> = Mutex::new(None);
@@ -39,7 +39,7 @@ fn should_attempt_to_get_checksum() -> bool {
         return false;
     }
 
-    if !get_settings().chat_log.capture_chat_log {
+    if !comms::state::get_capture_chat_log() {
         return false;
     }
 
@@ -50,71 +50,73 @@ fn should_attempt_to_get_checksum() -> bool {
     true
 }
 
-unsafe fn set_process_checksum() {
+fn set_process_checksum() {
     if !should_attempt_to_get_checksum() {
         return;
     }
 
     let pid = SWTOR_PID.lock().unwrap().unwrap();
 
-    let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
-    if handle.is_err() {
-        let err = handle.unwrap_err();
-        if err.code().0 == ACCESS_IS_DENIED {
-            PROCESS_IS_ACCESSIBLE.store(false, Ordering::Relaxed);
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
+        if handle.is_err() {
+            let err = handle.unwrap_err();
+            if err.code().0 == ACCESS_IS_DENIED {
+                PROCESS_IS_ACCESSIBLE.store(false, Ordering::Relaxed);
+            }
+
+            error!("Error opening process: {}", err);
+            return;
         }
 
-        error!("Error opening process: {}", err);
-        return;
-    }
+        let mut buffer: [u16; MAX_PATH as usize + 1] = [0; MAX_PATH as usize + 1];
+        let mut size = buffer.len() as u32;
 
-    let mut buffer: [u16; MAX_PATH as usize + 1] = [0; MAX_PATH as usize + 1];
-    let mut size = buffer.len() as u32;
+        if let Ok(_) = QueryFullProcessImageNameW(
+            handle.unwrap(),
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(&mut buffer as *mut _),
+            &mut size,
+        ) {
+            let path_str = String::from_utf16(&buffer).unwrap().replace("\0", "");
+            let path = Path::new(&path_str);
 
-    if let Ok(_) = QueryFullProcessImageNameW(
-        handle.unwrap(),
-        PROCESS_NAME_FORMAT(0),
-        PWSTR(&mut buffer as *mut _),
-        &mut size,
-    ) {
-        let path_str = String::from_utf16(&buffer).unwrap().replace("\0", "");
-        let path = Path::new(&path_str);
-
-        let program_bytes = fs::read(path).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(program_bytes);
-        PROCESS_CHECKSUM
-            .set(hasher.finalize().as_slice().to_vec())
-            .unwrap();
+            let program_bytes = fs::read(path).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(program_bytes);
+            PROCESS_CHECKSUM.set(hasher.finalize().to_vec()).unwrap();
+        }
     }
 }
 
-unsafe extern "system" fn enum_windows_existing_proc(hwnd: HWND, _param1: LPARAM) -> BOOL {
+extern "system" fn enum_windows_existing_proc(hwnd: HWND, _param1: LPARAM) -> BOOL {
     let mut text: [u16; 256] = [0; 256];
-    GetWindowTextW(hwnd, &mut text);
+    unsafe {
+        GetWindowTextW(hwnd, &mut text);
 
-    let window_text: String;
-    match String::from_utf16(&text) {
-        Ok(text) => {
-            window_text = text.replace("\0", "");
+        let window_text: String;
+        match String::from_utf16(&text) {
+            Ok(text) => {
+                window_text = text.replace("\0", "");
+            }
+            Err(_) => {
+                return BOOL(1);
+            }
         }
-        Err(_) => {
-            return BOOL(1);
+
+        if window_text == PROCESS_NAME {
+            let mut process_id: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut process_id as *mut u32));
+
+            SWTOR_PID.lock().unwrap().replace(process_id);
+            SWTOR_HWND.lock().unwrap().replace(hwnd);
+            set_process_checksum();
+
+            return BOOL(0);
         }
+
+        return BOOL(1);
     }
-
-    if window_text == PROCESS_NAME {
-        let mut process_id: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut process_id as *mut u32));
-
-        SWTOR_PID.lock().unwrap().replace(process_id);
-        SWTOR_HWND.lock().unwrap().replace(hwnd);
-        set_process_checksum();
-
-        return BOOL(0);
-    }
-
-    return BOOL(1);
 }
 
 pub fn hook_into_existing() {
@@ -149,33 +151,19 @@ pub fn checksum_match(checksum: &[u8; 32]) -> Result<bool, &'static str> {
     if let Some(process_checksum) = PROCESS_CHECKSUM.get() {
         return Ok(checksum.iter().eq(process_checksum.iter()));
     }
+
     return Err("PROCESS_CHECKSUM not yet initialized");
 }
 
-#[tauri::command]
 pub fn is_hooked_in() -> bool {
     SWTOR_HWND.lock().unwrap().is_some()
 }
 
-#[tauri::command]
-pub fn start_swtor_hook(window: Window) {
-    if SWTOR_HWND.lock().unwrap().is_some() {
-        return;
-    }
-
+pub fn start_swtor_hook() {
     thread::spawn(move || {
         loop {
             hook_into_existing();
-
-            window
-                .emit(
-                    "swtor_hooked_in",
-                    json!({
-                        "hooked_in": is_hooked_in(),
-                    }),
-                )
-                .unwrap();
-
+            comms::send(FromService::IsHookedIn(is_hooked_in()));
             thread::sleep(Duration::from_millis(1000));
         }
     });
