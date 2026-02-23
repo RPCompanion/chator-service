@@ -4,8 +4,11 @@ use std::thread;
 pub mod capture_injector;
 pub mod comms;
 pub mod logging;
+pub mod model;
+pub mod share;
 pub mod swtor;
 pub mod swtor_hook;
+pub mod utils;
 
 fn main() {
     let _guard = logging::init();

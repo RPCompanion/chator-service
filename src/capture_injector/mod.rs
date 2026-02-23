@@ -18,7 +18,7 @@ use dll_syringe::{Syringe, process::OwnedProcess};
 use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, Value};
 
-use crate::dal::db::swtor_message::SwtorMessage;
+use crate::comms;
 use crate::{share::CaptureMessage, swtor_hook};
 
 pub mod message_container;
@@ -45,7 +45,7 @@ pub enum CaptureError {
 }
 
 #[tauri::command]
-pub fn start_injecting_capture(window: tauri::Window) -> Result<(), CaptureError> {
+pub fn start_injecting_capture() -> Result<(), CaptureError> {
     if INJECTED.load(Ordering::Relaxed) {
         return Err(CaptureError::AlreadyInjected);
     }
@@ -62,11 +62,11 @@ pub fn start_injecting_capture(window: tauri::Window) -> Result<(), CaptureError
         Err(_) => return Err(CaptureError::NotYetFullyReady),
     }
 
-    start_injecting_thread(swtor_pid, window);
+    start_injecting_thread(swtor_pid);
     return Ok(());
 }
 
-fn start_injecting_thread(swtor_pid: u32, window: tauri::Window) {
+fn start_injecting_thread(swtor_pid: u32) {
     thread::spawn(move || {
         INJECTED.store(true, Ordering::Relaxed);
         CONTINUE_LOGGING.store(true, Ordering::Relaxed);
@@ -105,7 +105,7 @@ fn start_injecting_thread(swtor_pid: u32, window: tauri::Window) {
             start_tcp_listener_loop(listener, module_port);
         });
 
-        start_logging_propagation(window);
+        start_logging_propagation();
         tcp_thread.join().unwrap();
 
         if let Err(err) = syringe_container.eject() {
@@ -172,7 +172,7 @@ fn handle_message(message: CaptureMessage) {
     }
 }
 
-fn start_logging_propagation(window: tauri::Window) {
+fn start_logging_propagation() {
     thread::spawn(move || {
         while CONTINUE_LOGGING.load(Ordering::Relaxed)
             || !MESSAGE_CONTAINER
@@ -184,8 +184,7 @@ fn start_logging_propagation(window: tauri::Window) {
             let unstored_messages = MESSAGE_CONTAINER.lock().unwrap().drain_unstored();
 
             if !unstored_messages.is_empty() {
-                SwtorMessage::save_messages_to_db(unstored_messages.clone());
-                window.emit("swtor_messages", unstored_messages).unwrap();
+                comms::send(unstored_messages);
             }
 
             thread::sleep(Duration::from_secs(1));

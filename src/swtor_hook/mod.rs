@@ -24,6 +24,7 @@ use windows::core::PWSTR;
 use crate::comms::{self, FromService};
 
 pub mod message_hash_container;
+pub mod post;
 
 static SWTOR_HWND: Mutex<Option<HWND>> = Mutex::new(None);
 static SWTOR_PID: Mutex<Option<u32>> = Mutex::new(None);
@@ -39,7 +40,7 @@ fn should_attempt_to_get_checksum() -> bool {
         return false;
     }
 
-    if !comms::state::get_capture_chat_log() {
+    if !comms::state::capture_chat_log() {
         return false;
     }
 

@@ -1,0 +1,106 @@
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+pub struct CommandMessage {
+    pub command: Option<String>,
+    pub message: String,
+}
+
+impl CommandMessage {
+    pub fn new(command: Option<String>, message: String) -> Self {
+        Self { command, message }
+    }
+
+    pub fn concat(&self) -> String {
+        if self.command.is_none() {
+            return self.message.clone();
+        }
+
+        if self.message.len() == 0 {
+            return self.command.as_ref().unwrap().clone();
+        }
+
+        format!("{} {}", self.command.as_ref().unwrap(), self.message)
+    }
+
+    pub fn is_command_only(&self) -> bool {
+        self.command.is_some() && self.message.len() == 0
+    }
+
+    pub fn should_retry(&self) -> bool {
+        if let Some(command) = self.command.as_ref() {
+            if command == "/roll" {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub enum MessageType {
+    ButtonEmote,
+    ChatMessage,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct UserCharacterMessages {
+    pub message_type: MessageType,
+    pub character_id: Option<i32>,
+    pub messages: Vec<String>,
+}
+
+impl UserCharacterMessages {
+    pub fn prepare_messages(&mut self) {
+        self.messages.iter_mut().for_each(|message| {
+            *message = message.replace("ChatGPT", "").replace("”", "\"");
+        });
+    }
+
+    pub fn get_all_command_message_splits(&self) -> Result<Vec<CommandMessage>, &'static str> {
+        let mut c_and_m: Vec<CommandMessage> = Vec::new();
+
+        for message in self.messages.iter() {
+            c_and_m.push(self.get_command_message_split(message)?);
+        }
+
+        Ok(c_and_m)
+    }
+
+    fn get_command_message_split(&self, message: &str) -> Result<CommandMessage, &'static str> {
+        if !message.starts_with("/") {
+            return Ok(CommandMessage::new(None, message.to_string()));
+        }
+
+        let whisper_re = Regex::new(r"(\/w\s+|\/whisper\s+)([^:]+):").unwrap();
+        let whispers: Vec<&str> = whisper_re
+            .captures_iter(message)
+            .map(|c| c.get(0).unwrap().as_str())
+            .collect();
+
+        if whispers.len() > 1 {
+            return Err("Must have one whisper in a message");
+        } else if whispers.len() == 1 {
+            let whisper = whispers[0];
+            return Ok(CommandMessage::new(
+                Some(whisper.to_string()),
+                message.replace(whisper, "").trim().to_string(),
+            ));
+        }
+
+        // No whisper was captured, so it must be a simple command
+        let simple_re = Regex::new(r"^\/([a-zA-Z0-9]+)").unwrap();
+        let simple_command = simple_re
+            .captures(message)
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .as_str();
+
+        return Ok(CommandMessage::new(
+            Some(simple_command.to_string()),
+            message.replace(simple_command, "").trim().to_string(),
+        ));
+    }
+}

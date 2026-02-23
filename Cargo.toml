@@ -17,6 +17,10 @@ path = "src/main.rs"
 [dependencies]
 chrono = {version =  "0.4", features = ["serde"]}
 
+# Async
+futures = "0.3"
+tokio = { version = "1", features = ["time", "macros"] }
+
 # Helpers
 int-enum = "1.1"
 
@@ -24,6 +28,8 @@ int-enum = "1.1"
 thiserror = "2.0"
 microseh = "1.1"
 encoding_rs = "0.8"
+
+regex = "1.10"
 
 # Hashing
 sha2 = "0.10"
