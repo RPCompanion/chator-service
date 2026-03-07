@@ -2,8 +2,6 @@ use crate::model::user_character_message::CommandMessage;
 use crate::model::user_character_message::UserCharacterMessages;
 use crate::swtor::SwtorChannel;
 use crate::utils::StringUtils;
-use tokio::task;
-
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,23 +128,8 @@ fn non_retry_logic(character_message: UserCharacterMessages) -> Result<(), &'sta
     Ok(())
 }
 
-/*
-fn block_window_focus_thread(window: tauri::Window) {
-    thread::spawn(move || {
-        while WRITING.load(Ordering::Relaxed) {
-            if swtor_hook::window_in_focus() {
-                let _ = window.set_focus();
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
-    });
-}
-*/
-
-pub async fn submit_post(
+pub fn submit_post(
     retry: bool,
-    callback_id: i64,
     mut character_message: UserCharacterMessages,
 ) -> Result<(), &'static str> {
     if WRITING.load(Ordering::Relaxed) {
@@ -155,25 +138,17 @@ pub async fn submit_post(
 
     WRITING.store(true, Ordering::Relaxed);
 
-    //block_window_focus_thread();
-    let result = task::spawn_blocking(move || {
-        character_message.prepare_messages();
-        character_message.store();
+    character_message.prepare_messages();
 
-        MESSAGE_HASH_CONTAINER.lock().unwrap().clear();
+    MESSAGE_HASH_CONTAINER.lock().unwrap().clear();
 
-        prep_game_for_input();
+    prep_game_for_input();
 
-        if retry {
-            retry_logic(character_message)?;
-        } else {
-            non_retry_logic(character_message)?;
-        }
-
-        Ok(())
-    })
-    .await
-    .unwrap();
+    let result = if retry {
+        retry_logic(character_message)
+    } else {
+        non_retry_logic(character_message)
+    };
 
     WRITING.store(false, Ordering::Relaxed);
     result

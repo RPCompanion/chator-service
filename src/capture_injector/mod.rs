@@ -18,7 +18,7 @@ use dll_syringe::{Syringe, process::OwnedProcess};
 use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, Value};
 
-use crate::comms;
+use crate::comms::{self, FromService};
 use crate::{share::CaptureMessage, swtor_hook};
 
 pub mod message_container;
@@ -183,8 +183,8 @@ fn start_logging_propagation() {
         {
             let unstored_messages = MESSAGE_CONTAINER.lock().unwrap().drain_unstored();
 
-            if !unstored_messages.is_empty() {
-                comms::send(unstored_messages);
+            for msg in unstored_messages {
+                comms::send(FromService::SwtorMessage(msg));
             }
 
             thread::sleep(Duration::from_secs(1));

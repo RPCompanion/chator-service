@@ -17,6 +17,17 @@ fn default_timestamp() -> DateTime<Utc> {
     Utc::now()
 }
 
+impl SwtorMessage {
+    pub fn get_parsed_message(&self) -> String {
+        self.message
+            .replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace("&apos;", "'")
+    }
+}
+
 impl From<RawSwtorMessage> for SwtorMessage {
     fn from(raw_swtor_message: RawSwtorMessage) -> Self {
         SwtorMessage {

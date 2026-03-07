@@ -1,6 +1,5 @@
 use crate::comms::state::retry_message_submission;
-use crate::dal::db::settings;
-use crate::share::swtor_message::SwtorMessage;
+use crate::model::swtor_message::SwtorMessage;
 use crate::share::*;
 use crate::swtor::SwtorChannel;
 use crate::swtor_hook::post;

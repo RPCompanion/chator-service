@@ -1,5 +1,6 @@
 use std::net::TcpStream;
-use std::thread;
+
+use tracing::{error, info};
 
 pub mod capture_injector;
 pub mod comms;
@@ -12,15 +13,31 @@ pub mod utils;
 
 fn main() {
     let _guard = logging::init();
-    let mut stream = TcpStream::connect("127.0.0.1:30100").unwrap();
-    let mut reader = stream.try_clone().expect("Clone failed");
 
-    setup_write_stream(stream);
-    loop_read_stream(reader);
-}
+    let address = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:30100".to_string());
 
-fn loop_read_stream(mut reader: TcpStream) {}
+    info!("Connecting to ChaTOR at {}", address);
 
-fn setup_write_stream(mut stream: TcpStream) {
-    thread::spawn(move || {});
+    let stream = match TcpStream::connect(&address) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to connect to ChaTOR at {}: {}", address, e);
+            return;
+        }
+    };
+
+    let read_stream = stream.try_clone().expect("Failed to clone TCP stream");
+
+    comms::init(stream);
+    info!("Connected to ChaTOR");
+
+    swtor_hook::start_swtor_hook();
+    info!("SWTOR hook started");
+
+    // Blocking — runs until the connection drops
+    comms::recv_loop(read_stream);
+
+    info!("Shutting down");
 }
