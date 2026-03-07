@@ -79,6 +79,19 @@ fn handle_message(msg: FromClient) {
         FromClient::CaptureChatLog(value) => {
             info!("CaptureChatLog set to {}", value);
             state::set_capture_chat_log(value);
+            if value {
+                // Ensure checksum is computed before attempting injection
+                crate::swtor_hook::set_process_checksum();
+                info!("Starting capture injection...");
+                match crate::capture_injector::start_injecting_capture() {
+                    Ok(()) => info!("Capture injection started successfully"),
+                    Err(e) => error!("Capture injection failed: {:?}", e),
+                }
+            } else {
+                info!("Stopping capture injection...");
+                crate::capture_injector::stop_injecting_capture();
+                info!("Capture injection stopped");
+            }
         }
         FromClient::RetryMessageSubmission(value) => {
             info!("RetryMessageSubmission set to {}", value);
@@ -89,8 +102,10 @@ fn handle_message(msg: FromClient) {
             character_message,
             callback_id,
         } => {
+            info!("SubmitPost received (callback_id: {}, retry: {})", callback_id, retry);
             std::thread::spawn(move || {
                 let result = crate::swtor_hook::post::submit_post(retry, character_message);
+                info!("SubmitPost result (callback_id: {}): {:?}", callback_id, result);
                 send(FromService::SubmitPostResult {
                     callback_id,
                     result: result.map_err(|e| e.to_string()),

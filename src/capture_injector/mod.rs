@@ -35,7 +35,7 @@ static MESSAGE_CONTAINER: LazyLock<Mutex<SwtorMessageContainer>> =
 static INJECTED: AtomicBool = AtomicBool::new(false);
 static CONTINUE_LOGGING: AtomicBool = AtomicBool::new(false);
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum CaptureError {
     AlreadyInjected,
     SwtorNotRunning,
@@ -44,44 +44,58 @@ pub enum CaptureError {
     NotYetFullyReady,
 }
 
-#[tauri::command]
 pub fn start_injecting_capture() -> Result<(), CaptureError> {
-    if INJECTED.load(Ordering::Relaxed) {
+    info!("start_injecting_capture called");
+
+    if INJECTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        info!("Already injected, skipping");
         return Err(CaptureError::AlreadyInjected);
     }
 
     let swtor_pid = swtor_hook::get_pid();
     if swtor_pid.is_none() {
+        error!("SWTOR process not found");
         return Err(CaptureError::SwtorNotRunning);
     }
     let swtor_pid = swtor_pid.unwrap();
+    info!("Found SWTOR process (pid: {})", swtor_pid);
 
     match swtor_hook::checksum_match(&SUPPORTED_SWTOR_CHECKSUM) {
-        Ok(true) => {}
-        Ok(false) => return Err(CaptureError::UnsupportedVersion),
-        Err(_) => return Err(CaptureError::NotYetFullyReady),
+        Ok(true) => info!("SWTOR checksum matches supported version"),
+        Ok(false) => {
+            error!("SWTOR checksum does not match supported version");
+            return Err(CaptureError::UnsupportedVersion);
+        }
+        Err(e) => {
+            error!("Could not verify SWTOR checksum: {:?}", e);
+            return Err(CaptureError::NotYetFullyReady);
+        }
     }
 
+    info!("Starting injection thread for pid {}", swtor_pid);
     start_injecting_thread(swtor_pid);
-    return Ok(());
+    Ok(())
 }
 
 fn start_injecting_thread(swtor_pid: u32) {
     thread::spawn(move || {
-        INJECTED.store(true, Ordering::Relaxed);
+        info!("Injection thread started for pid {}", swtor_pid);
         CONTINUE_LOGGING.store(true, Ordering::Relaxed);
 
         let target_process = OwnedProcess::from_pid(swtor_pid).unwrap();
         let syringe = Syringe::for_process(target_process);
 
+        info!("Injecting DLL into SWTOR...");
         let syringe_container = SyringeContainer::inject(&syringe);
 
-        if syringe_container.is_err() {
+        if let Err(ref e) = syringe_container {
+            error!("DLL injection failed: {:?}", e);
             INJECTED.store(false, Ordering::Relaxed);
             CONTINUE_LOGGING.store(false, Ordering::Relaxed);
             return;
         }
 
+        info!("DLL injection succeeded");
         let syringe_container = syringe_container.unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -173,6 +187,7 @@ fn handle_message(message: CaptureMessage) {
 }
 
 fn start_logging_propagation() {
+    info!("Starting message propagation loop");
     thread::spawn(move || {
         while CONTINUE_LOGGING.load(Ordering::Relaxed)
             || !MESSAGE_CONTAINER
@@ -183,16 +198,21 @@ fn start_logging_propagation() {
         {
             let unstored_messages = MESSAGE_CONTAINER.lock().unwrap().drain_unstored();
 
+            if !unstored_messages.is_empty() {
+                info!("Propagating {} captured message(s) to ChaTOR", unstored_messages.len());
+            }
+
             for msg in unstored_messages {
+                debug!("Sending captured message: {:?}", msg);
                 comms::send(FromService::SwtorMessage(msg));
             }
 
             thread::sleep(Duration::from_secs(1));
         }
+        info!("Message propagation loop ended");
     });
 }
 
-#[tauri::command]
 pub fn stop_injecting_capture() {
     if !INJECTED.load(Ordering::Relaxed) {
         return;

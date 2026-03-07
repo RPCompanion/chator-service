@@ -65,15 +65,24 @@ pub struct SyringeContainer<'a> {
 
 impl<'a> SyringeContainer<'a> {
     pub fn inject(syringe: &'a Syringe) -> Result<SyringeContainer<'a>, &'static str> {
-        let injected_payload = if cfg!(debug_assertions) {
-            syringe.find_or_inject("./target/debug/swtor_chat_capture.dll")
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let dll_path = if cfg!(debug_assertions) {
+            exe_dir.join("swtor_chat_capture.dll")
         } else {
-            syringe.find_or_inject("./swtor_chat_capture.dll")
+            exe_dir.join("swtor_chat_capture.dll")
         };
+
+        info!("Injecting DLL from: {}", dll_path.display());
+
+        let injected_payload = syringe.find_or_inject(&dll_path);
 
         match injected_payload {
             Ok(_) => {
-                info!("Payload injected");
+                info!("Payload injected successfully");
             }
             Err(err) => {
                 error!("Error injecting payload: {:?}", err);

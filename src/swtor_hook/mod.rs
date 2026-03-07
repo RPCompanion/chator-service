@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use tracing::error;
+use tracing::{error, info, debug};
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, MAX_PATH};
 use windows::Win32::System::Threading::{
@@ -37,10 +37,7 @@ const PROCESS_NAME: &str = "Star Wars™: The Old Republic™";
 
 fn should_attempt_to_get_checksum() -> bool {
     if !PROCESS_IS_ACCESSIBLE.load(Ordering::Relaxed) {
-        return false;
-    }
-
-    if !comms::state::capture_chat_log() {
+        debug!("Checksum skip: process not accessible");
         return false;
     }
 
@@ -51,12 +48,22 @@ fn should_attempt_to_get_checksum() -> bool {
     true
 }
 
-fn set_process_checksum() {
+/// Attempts to compute the SWTOR process checksum. Call this when SWTOR is found
+/// and when capture is enabled — both conditions must hold for injection to work.
+pub fn set_process_checksum() {
     if !should_attempt_to_get_checksum() {
         return;
     }
 
-    let pid = SWTOR_PID.lock().unwrap().unwrap();
+    let pid = match *SWTOR_PID.lock().unwrap() {
+        Some(pid) => pid,
+        None => {
+            debug!("Checksum skip: no SWTOR PID");
+            return;
+        }
+    };
+
+    info!("Attempting to compute SWTOR process checksum (pid: {})", pid);
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
@@ -64,6 +71,7 @@ fn set_process_checksum() {
             let err = handle.unwrap_err();
             if err.code().0 == ACCESS_IS_DENIED {
                 PROCESS_IS_ACCESSIBLE.store(false, Ordering::Relaxed);
+                error!("Access denied opening SWTOR process — are we running as admin?");
             }
 
             error!("Error opening process: {}", err);
@@ -73,19 +81,33 @@ fn set_process_checksum() {
         let mut buffer: [u16; MAX_PATH as usize + 1] = [0; MAX_PATH as usize + 1];
         let mut size = buffer.len() as u32;
 
-        if let Ok(_) = QueryFullProcessImageNameW(
+        match QueryFullProcessImageNameW(
             handle.unwrap(),
             PROCESS_NAME_FORMAT(0),
             PWSTR(&mut buffer as *mut _),
             &mut size,
         ) {
-            let path_str = String::from_utf16(&buffer).unwrap().replace("\0", "");
-            let path = Path::new(&path_str);
+            Ok(_) => {
+                let path_str = String::from_utf16(&buffer).unwrap().replace("\0", "");
+                info!("SWTOR executable path: {}", path_str);
+                let path = Path::new(&path_str);
 
-            let program_bytes = fs::read(path).unwrap();
-            let mut hasher = Sha256::new();
-            hasher.update(program_bytes);
-            PROCESS_CHECKSUM.set(hasher.finalize().to_vec()).unwrap();
+                match fs::read(path) {
+                    Ok(program_bytes) => {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&program_bytes);
+                        let checksum = hasher.finalize().to_vec();
+                        info!("SWTOR checksum computed: {:X?}", &checksum[..8]);
+                        let _ = PROCESS_CHECKSUM.set(checksum);
+                    }
+                    Err(e) => {
+                        error!("Failed to read SWTOR executable at {}: {}", path_str, e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("QueryFullProcessImageNameW failed: {}", e);
+            }
         }
     }
 }
@@ -162,9 +184,19 @@ pub fn is_hooked_in() -> bool {
 
 pub fn start_swtor_hook() {
     thread::spawn(move || {
+        let mut last_hooked_in = false;
         loop {
             hook_into_existing();
-            comms::send(FromService::IsHookedIn(is_hooked_in()));
+            let hooked_in = is_hooked_in();
+            if hooked_in != last_hooked_in {
+                info!("SWTOR hooked_in changed: {} -> {}", last_hooked_in, hooked_in);
+                if hooked_in {
+                    info!("SWTOR found (pid: {:?})", get_pid());
+                }
+                last_hooked_in = hooked_in;
+            }
+            debug!("Sending IsHookedIn({})", hooked_in);
+            comms::send(FromService::IsHookedIn(hooked_in));
             thread::sleep(Duration::from_millis(1000));
         }
     });
