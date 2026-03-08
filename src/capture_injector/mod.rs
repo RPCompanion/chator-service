@@ -24,7 +24,7 @@ use crate::{share::CaptureMessage, swtor_hook};
 pub mod message_container;
 mod syringe_container;
 
-use self::message_container::SwtorMessageContainer;
+use self::message_container::{CapturedMessage, SwtorMessageContainer};
 
 const SUPPORTED_SWTOR_CHECKSUM: [u8; 32] =
     sha256_to_array!("58A46A11EDB0B7DC98DBAB590C01BC91BAD79A558CE6BEADAFF656FEBD8E3DD4");
@@ -180,7 +180,8 @@ fn handle_message(message: CaptureMessage) {
         CaptureMessage::Panic(panic_message) => {
             panic!("{}", panic_message);
         }
-        _ => {
+        ref m => {
+            debug!("handle_message received: {:?}", m);
             MESSAGE_CONTAINER.lock().unwrap().push(message);
         }
     }
@@ -203,8 +204,16 @@ fn start_logging_propagation() {
             }
 
             for msg in unstored_messages {
-                debug!("Sending captured message: {:?}", msg);
-                comms::send(FromService::SwtorMessage(msg));
+                match msg {
+                    CapturedMessage::Chat(swtor_msg) => {
+                        debug!("Sending captured chat message: {:?}", swtor_msg);
+                        comms::send(FromService::SwtorMessage(swtor_msg));
+                    }
+                    CapturedMessage::Roll(dice_roll) => {
+                        info!("[ROLL] Sending dice roll to ChaTOR: player={}, result={}", dice_roll.player_name, dice_roll.result_text);
+                        comms::send(FromService::DiceRoll(dice_roll));
+                    }
+                }
             }
 
             thread::sleep(Duration::from_secs(1));

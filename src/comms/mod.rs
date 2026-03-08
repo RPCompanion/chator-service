@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::model::{swtor_message::SwtorMessage, user_character_message::UserCharacterMessages};
+use crate::model::{dice_roll::DiceRoll, swtor_message::SwtorMessage, user_character_message::UserCharacterMessages};
 
 pub mod state;
 
@@ -24,6 +24,7 @@ pub enum FromClient {
 pub enum FromService {
     IsHookedIn(bool),
     SwtorMessage(SwtorMessage),
+    DiceRoll(DiceRoll),
     SubmitPostResult {
         callback_id: i64,
         result: Result<(), String>,

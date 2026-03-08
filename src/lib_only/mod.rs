@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use crate::share::{AsJson, CaptureMessage};
 
 pub mod chat_message;
+pub mod dice_roll;
 pub mod friends_list;
 
 static MESSAGES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));

@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use lib_only::chat_message;
+use lib_only::dice_roll;
 
 use share::CaptureMessage;
 
@@ -167,8 +168,10 @@ fn begin_hook() {
 
 fn begin_detours(base_address: isize) {
     chat_message::begin_detour(base_address);
+    dice_roll::begin_detour(base_address);
 }
 
 fn end_detours() {
     chat_message::end_detour();
+    dice_roll::end_detour();
 }
