@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use lib_only::chat_message;
+use lib_only::cmd_dispatch;
 use lib_only::dice_roll;
 
 use share::CaptureMessage;
@@ -64,7 +65,7 @@ extern "system" fn init_capture_module(chator_port: u16) -> u16 {
     LOCAL_PORT.store(port, Ordering::Relaxed);
 
     set_panic_hook();
-    start_quit_listener(listener);
+    start_command_listener(listener);
 
     if let Err(_) = start_tcp_messenger() {
         return 0;
@@ -140,9 +141,56 @@ fn set_panic_hook() {
     }));
 }
 
-fn start_quit_listener(listener: TcpListener) {
+fn start_command_listener(listener: TcpListener) {
     thread::spawn(move || {
-        listener.accept().unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let write_stream = stream.try_clone().unwrap();
+        let reader = std::io::BufReader::new(stream);
+        let mut writer = std::io::BufWriter::new(write_stream);
+
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<share::dll_command::DllCommand>(&line) {
+                Ok(share::dll_command::DllCommand::Stop) => break,
+                Ok(share::dll_command::DllCommand::SendChatCommand { command, message }) => {
+                    let result = cmd_dispatch::send_command(&command, &message);
+                    let response = share::dll_command::DllResponse::SendChatResult(result);
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let _ = writer.write_all(json.as_bytes());
+                        let _ = writer.write_all(b"\n");
+                        let _ = writer.flush();
+                    }
+                }
+                Ok(share::dll_command::DllCommand::Diagnostics) => {
+                    let info = cmd_dispatch::get_diagnostics();
+                    let response = share::dll_command::DllResponse::DiagnosticsResult(info);
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let _ = writer.write_all(json.as_bytes());
+                        let _ = writer.write_all(b"\n");
+                        let _ = writer.flush();
+                    }
+                }
+                Err(_) => {
+                    if line.trim() == "stop" {
+                        break;
+                    }
+                    submit_message(CaptureMessage::Error(format!(
+                        "Invalid DLL command: {}",
+                        line
+                    )));
+                }
+            }
+        }
+
         end_detours();
         QUIT.store(true, Ordering::Relaxed);
     });
@@ -169,9 +217,11 @@ fn begin_hook() {
 fn begin_detours(base_address: isize) {
     chat_message::begin_detour(base_address);
     dice_roll::begin_detour(base_address);
+    cmd_dispatch::begin_detour(base_address);
 }
 
 fn end_detours() {
     chat_message::end_detour();
     dice_roll::end_detour();
+    cmd_dispatch::end_detour();
 }

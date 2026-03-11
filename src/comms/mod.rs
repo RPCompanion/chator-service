@@ -5,7 +5,11 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::model::{dice_roll::DiceRoll, swtor_message::SwtorMessage, user_character_message::UserCharacterMessages};
+use crate::model::{
+    dice_roll::DiceRoll,
+    swtor_message::SwtorMessage,
+    user_character_message::UserCharacterMessages,
+};
 
 pub mod state;
 
@@ -103,15 +107,84 @@ fn handle_message(msg: FromClient) {
             character_message,
             callback_id,
         } => {
-            info!("SubmitPost received (callback_id: {}, retry: {})", callback_id, retry);
+            info!(
+                "SubmitPost received (callback_id: {}, retry: {})",
+                callback_id, retry
+            );
             std::thread::spawn(move || {
-                let result = crate::swtor_hook::post::submit_post(retry, character_message);
-                info!("SubmitPost result (callback_id: {}): {:?}", callback_id, result);
+                let result = route_submit_post(retry, character_message);
+                info!(
+                    "SubmitPost result (callback_id: {}): {:?}",
+                    callback_id, result
+                );
                 send(FromService::SubmitPostResult {
                     callback_id,
-                    result: result.map_err(|e| e.to_string()),
+                    result,
                 });
             });
         }
     }
+}
+
+fn is_roll_command(msg: &str) -> bool {
+    let trimmed = msg.trim().to_ascii_lowercase();
+    trimmed == "/roll" || trimmed.starts_with("/roll ")
+}
+
+fn parse_slash_command(msg: &str) -> Option<(String, String)> {
+    let trimmed = msg.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let without_slash = &trimmed[1..];
+    if let Some(space_idx) = without_slash.find(' ') {
+        let cmd = without_slash[..space_idx].to_string();
+        let message = without_slash[space_idx + 1..].to_string();
+        Some((cmd, message))
+    } else {
+        Some((without_slash.to_string(), String::new()))
+    }
+}
+
+fn route_submit_post(
+    retry: bool,
+    mut character_message: UserCharacterMessages,
+) -> Result<(), String> {
+    character_message.prepare_messages();
+
+    let message_type = character_message.message_type;
+    let character_id = character_message.character_id;
+    let mut keystroke_messages = Vec::new();
+
+    for message in &character_message.messages {
+        if is_roll_command(message) || !message.starts_with('/') {
+            keystroke_messages.push(message.clone());
+        } else if let Some((cmd, text)) = parse_slash_command(message) {
+            match crate::capture_injector::send_chat_command(&cmd, &text) {
+                Ok(()) => {
+                    info!("Direct dispatch succeeded: /{} {}", cmd, text);
+                }
+                Err(e) => {
+                    info!(
+                        "Direct dispatch failed ({}), falling back to keystroke injection",
+                        e
+                    );
+                    keystroke_messages.push(message.clone());
+                }
+            }
+        } else {
+            keystroke_messages.push(message.clone());
+        }
+    }
+
+    if !keystroke_messages.is_empty() {
+        let ks_cm = UserCharacterMessages {
+            message_type,
+            character_id,
+            messages: keystroke_messages,
+        };
+        crate::swtor_hook::post::submit_post(retry, ks_cm).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }

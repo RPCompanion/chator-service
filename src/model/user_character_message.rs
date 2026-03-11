@@ -38,7 +38,7 @@ impl CommandMessage {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone, Copy)]
 pub enum MessageType {
     ButtonEmote,
     ChatMessage,

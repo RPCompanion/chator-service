@@ -1,9 +1,9 @@
-use std::mem;
 use retour::static_detour;
+use std::mem;
 
 use crate::lib_only::submit_message;
-use crate::share::raw_dice_roll::RawDiceRoll;
 use crate::share::CaptureMessage;
+use crate::share::raw_dice_roll::RawDiceRoll;
 
 const ROLL_HANDLER_RELATIVE_ADDRESS: isize = 0x0e561d0;
 
@@ -64,24 +64,28 @@ fn roll_handler_detour(
     param_array: *const *const u16,
     param_count: i32,
 ) -> i64 {
-    submit_message(CaptureMessage::Info(
-        format!("roll_handler_detour called: param_count={}, output_buf_null={}, param_array_null={}",
-            param_count, output_buf.is_null(), param_array.is_null()),
-    ));
+    submit_message(CaptureMessage::Info(format!(
+        "roll_handler_detour called: param_count={}, output_buf_null={}, param_array_null={}",
+        param_count,
+        output_buf.is_null(),
+        param_array.is_null()
+    )));
 
     if param_count == 2 && !output_buf.is_null() && !param_array.is_null() {
         unsafe {
             if let Some(template) = read_wstr(output_buf as *const u16) {
-                submit_message(CaptureMessage::Info(
-                    format!("roll_handler_detour template: \"{}\"", template),
-                ));
+                submit_message(CaptureMessage::Info(format!(
+                    "roll_handler_detour template: \"{}\"",
+                    template
+                )));
                 if template.contains("rolls") && template.contains("Random") {
                     let player_name = read_wstr(*param_array);
                     let result_text = read_wstr(*param_array.add(1));
 
-                    submit_message(CaptureMessage::Info(
-                        format!("roll_handler_detour matched! player={:?}, result={:?}", player_name, result_text),
-                    ));
+                    submit_message(CaptureMessage::Info(format!(
+                        "roll_handler_detour matched! player={:?}, result={:?}",
+                        player_name, result_text
+                    )));
 
                     if let (Some(player), Some(result)) = (player_name, result_text) {
                         submit_message(CaptureMessage::Roll(RawDiceRoll::new(player, result)));

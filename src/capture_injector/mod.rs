@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, Value};
 
 use crate::comms::{self, FromService};
+use crate::share::dll_command::{DllCommand, DllResponse};
 use crate::{share::CaptureMessage, swtor_hook};
 
 pub mod message_container;
@@ -27,13 +28,118 @@ mod syringe_container;
 use self::message_container::{CapturedMessage, SwtorMessageContainer};
 
 const SUPPORTED_SWTOR_CHECKSUM: [u8; 32] =
-    sha256_to_array!("58A46A11EDB0B7DC98DBAB590C01BC91BAD79A558CE6BEADAFF656FEBD8E3DD4");
+    sha256_to_array!("584261b3cde36978175efb6e3b5dde4026ca17bb4138cf8fa49637dcb673524e");
 
 static MESSAGE_CONTAINER: LazyLock<Mutex<SwtorMessageContainer>> =
     LazyLock::new(|| Mutex::new(SwtorMessageContainer::new()));
 
 static INJECTED: AtomicBool = AtomicBool::new(false);
 static CONTINUE_LOGGING: AtomicBool = AtomicBool::new(false);
+
+struct DllConnection {
+    reader: std::io::BufReader<TcpStream>,
+    writer: TcpStream,
+}
+
+static DLL_CONNECTION: LazyLock<Mutex<Option<DllConnection>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn connect_to_dll(port: u16) {
+    match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+        Ok(stream) => {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let writer = stream;
+            *DLL_CONNECTION.lock().unwrap() = Some(DllConnection { reader, writer });
+            info!("Connected to DLL command port {}", port);
+        }
+        Err(e) => {
+            error!("Failed to connect to DLL command port: {}", e);
+        }
+    }
+}
+
+fn disconnect_dll() {
+    let mut guard = DLL_CONNECTION.lock().unwrap();
+    if let Some(mut conn) = guard.take() {
+        if let Ok(json) = serde_json::to_string(&DllCommand::Stop) {
+            let _ = conn.writer.write_all(json.as_bytes());
+            let _ = conn.writer.write_all(b"\n");
+            let _ = conn.writer.flush();
+        }
+    }
+}
+
+pub fn send_diagnostics() -> Result<crate::share::dll_command::DiagnosticsInfo, String> {
+    let mut guard = DLL_CONNECTION
+        .lock()
+        .map_err(|_| "Lock poisoned".to_string())?;
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "DLL not connected".to_string())?;
+
+    let cmd = DllCommand::Diagnostics;
+    let mut json = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+    json.push('\n');
+    conn.writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
+    conn.writer
+        .flush()
+        .map_err(|e| format!("Flush failed: {}", e))?;
+
+    let mut line = String::new();
+    use std::io::BufRead;
+    conn.reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Read failed: {}", e))?;
+
+    let resp: DllResponse =
+        serde_json::from_str(line.trim()).map_err(|e| format!("Parse response failed: {}", e))?;
+
+    match resp {
+        DllResponse::DiagnosticsResult(info) => Ok(info),
+        _ => Err("Unexpected response type".to_string()),
+    }
+}
+
+pub fn send_chat_command(command: &str, message: &str) -> Result<(), String> {
+    let mut guard = DLL_CONNECTION
+        .lock()
+        .map_err(|_| "Lock poisoned".to_string())?;
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "DLL not connected".to_string())?;
+
+    let cmd = DllCommand::SendChatCommand {
+        command: command.to_string(),
+        message: message.to_string(),
+    };
+    let mut json = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+    json.push('\n');
+    conn.writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
+    conn.writer
+        .flush()
+        .map_err(|e| format!("Flush failed: {}", e))?;
+
+    let mut line = String::new();
+    use std::io::BufRead;
+    conn.reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Read failed: {}", e))?;
+
+    let resp: DllResponse =
+        serde_json::from_str(line.trim()).map_err(|e| format!("Parse response failed: {}", e))?;
+
+    match resp {
+        DllResponse::SendChatResult(r) => r,
+        _ => Err("Unexpected response type".to_string()),
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CaptureError {
@@ -47,7 +153,10 @@ pub enum CaptureError {
 pub fn start_injecting_capture() -> Result<(), CaptureError> {
     info!("start_injecting_capture called");
 
-    if INJECTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    if INJECTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         info!("Already injected, skipping");
         return Err(CaptureError::AlreadyInjected);
     }
@@ -115,12 +224,17 @@ fn start_injecting_thread(swtor_pid: u32) {
 
         info!("Module listening on {}", module_port);
 
+        connect_to_dll(module_port);
+
         let tcp_thread = thread::spawn(move || {
-            start_tcp_listener_loop(listener, module_port);
+            start_tcp_listener_loop(listener);
         });
 
         start_logging_propagation();
         tcp_thread.join().unwrap();
+
+        disconnect_dll();
+        thread::sleep(Duration::from_secs(1));
 
         if let Err(err) = syringe_container.eject() {
             error!("Error ejecting payload: {:?}", err);
@@ -133,7 +247,7 @@ fn start_injecting_thread(swtor_pid: u32) {
     });
 }
 
-fn start_tcp_listener_loop(listener: TcpListener, module_port: u16) {
+fn start_tcp_listener_loop(listener: TcpListener) {
     let mut stream = listener.accept().unwrap().0;
 
     stream
@@ -167,12 +281,6 @@ fn start_tcp_listener_loop(listener: TcpListener, module_port: u16) {
         buffer = [0; 2048];
     }
     info!("Stopped listening for messages");
-
-    if let Ok(mut stream) = TcpStream::connect(&format!("127.0.0.1:{}", module_port)) {
-        stream.write(b"stop").unwrap();
-    }
-
-    thread::sleep(Duration::from_secs(1));
 }
 
 fn handle_message(message: CaptureMessage) {
@@ -200,7 +308,10 @@ fn start_logging_propagation() {
             let unstored_messages = MESSAGE_CONTAINER.lock().unwrap().drain_unstored();
 
             if !unstored_messages.is_empty() {
-                info!("Propagating {} captured message(s) to ChaTOR", unstored_messages.len());
+                info!(
+                    "Propagating {} captured message(s) to ChaTOR",
+                    unstored_messages.len()
+                );
             }
 
             for msg in unstored_messages {
@@ -210,7 +321,10 @@ fn start_logging_propagation() {
                         comms::send(FromService::SwtorMessage(swtor_msg));
                     }
                     CapturedMessage::Roll(dice_roll) => {
-                        info!("[ROLL] Sending dice roll to ChaTOR: player={}, result={}", dice_roll.player_name, dice_roll.result_text);
+                        info!(
+                            "[ROLL] Sending dice roll to ChaTOR: player={}, result={}",
+                            dice_roll.player_name, dice_roll.result_text
+                        );
                         comms::send(FromService::DiceRoll(dice_roll));
                     }
                 }
