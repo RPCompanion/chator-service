@@ -7,6 +7,7 @@ pub mod chat_message;
 pub mod cmd_dispatch;
 pub mod dice_roll;
 pub mod friends_list;
+pub mod sigscan;
 
 static MESSAGES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 

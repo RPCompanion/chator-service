@@ -32,7 +32,7 @@ encoding_rs = "0.8"
 regex = "1.10"
 
 # Hashing
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -47,20 +47,10 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Injection
-ctor = "0.2.8"
-dll-syringe = { version = "0.17.1", features = ["payload-utils"] }
+ctor = "1.0.13"
+dll-syringe = { version = "0.18.2", features = ["payload-utils"] }
 retour = { version = "0.4.0-alpha.3", features = ["static-detour"] }
 
 # Windows
 clipboard-win = "5.0.0"
-windows = { version = "0.52", features = [
-    "Data_Xml_Dom", 
-    "Win32_Foundation", 
-    "Win32_Security", 
-    "Win32_System_Memory",
-    "Win32_System_Threading", 
-    "Win32_System_LibraryLoader", 
-    "Win32_UI_WindowsAndMessaging", 
-    "Win32_UI_Input_KeyboardAndMouse", 
-    "Win32_System_ProcessStatus", 
-    "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Data_Xml_Dom", "Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_ProcessStatus"] }

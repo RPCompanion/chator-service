@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod dll_command;
 pub mod module_ports;
+pub mod offsets;
 pub mod raw_swtor_message;
 pub mod raw_dice_roll;
 

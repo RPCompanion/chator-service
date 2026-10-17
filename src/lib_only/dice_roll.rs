@@ -5,8 +5,6 @@ use crate::lib_only::submit_message;
 use crate::share::CaptureMessage;
 use crate::share::raw_dice_roll::RawDiceRoll;
 
-const ROLL_HANDLER_RELATIVE_ADDRESS: isize = 0x0e561d0;
-
 static_detour! {
     static RollHook: extern "C" fn(*mut u16, i32, *const *const u16, i32) -> i64;
 }
@@ -29,25 +27,23 @@ unsafe fn read_wstr(ptr: *const u16) -> Option<String> {
     }
 }
 
-pub fn begin_detour(base_address: isize) {
+/// Installs the roll handler detour at an absolute address.
+pub fn begin_detour(target_address: usize) -> Result<(), String> {
     unsafe {
         let target: extern "C" fn(*mut u16, i32, *const *const u16, i32) -> i64 =
-            mem::transmute(base_address + ROLL_HANDLER_RELATIVE_ADDRESS);
-
-        match RollHook.initialize(target, roll_handler_detour) {
-            Ok(_) => {
-                submit_message(CaptureMessage::Info(
-                    "Dice roll detour initialized".to_string(),
-                ));
-                RollHook.enable().unwrap();
-            }
-            Err(_) => {
-                submit_message(CaptureMessage::CaptureError(
-                    "Failed to initialize dice roll detour".to_string(),
-                ));
-            }
-        }
+            mem::transmute(target_address);
+        RollHook
+            .initialize(target, roll_handler_detour)
+            .map_err(|e| format!("initialize failed: {:?}", e))?;
+        RollHook
+            .enable()
+            .map_err(|e| format!("enable failed: {:?}", e))?;
     }
+    submit_message(CaptureMessage::Info(format!(
+        "Dice roll detour initialized at 0x{:x}",
+        target_address
+    )));
+    Ok(())
 }
 
 /// Detour for the template parameter substitution function (FUN_140e561d0).
@@ -104,6 +100,6 @@ fn roll_handler_detour(
 
 pub fn end_detour() {
     unsafe {
-        RollHook.disable().unwrap();
+        let _ = RollHook.disable();
     }
 }

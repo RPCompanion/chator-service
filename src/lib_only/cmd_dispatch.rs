@@ -7,15 +7,18 @@ use crate::lib_only::submit_message;
 use crate::share::CaptureMessage;
 use crate::share::dll_command::DiagnosticsInfo;
 
-const CMD_DISPATCH_RELATIVE_ADDRESS: isize = 0x03e23c0;
-
 /// Global pointer chain to find cmd_dispatch args without hooking:
-///   [base + GLOBAL_PTR_RVA] -> obj
-///     obj + 0x30 = cmdContext  (vtable at base + CONTEXT_VTABLE_RVA)
-///       cmdContext + 0x48 = cmdManager (vtable at base + MANAGER_VTABLE_RVA)
-const GLOBAL_PTR_RVA: isize = 0x1baa530;
-const CONTEXT_VTABLE_RVA: isize = 0x1482c50;
-const MANAGER_VTABLE_RVA: isize = 0x1482e88;
+///   [base + global_ptr] -> obj
+///     obj + 0x30 = cmdContext  (vtable at base + context_vtable)
+///       cmdContext + 0x48 = cmdManager (vtable at base + manager_vtable)
+///
+/// All three are RVAs supplied by the offset table for the running build.
+#[derive(Clone, Copy, Debug)]
+pub struct GlobalChain {
+    pub global_ptr: usize,
+    pub context_vtable: usize,
+    pub manager_vtable: usize,
+}
 
 // cmd_dispatch is void(manager, cmd_name_sso, msg_sso) — 3 args, no return value.
 static_detour! {
@@ -24,6 +27,7 @@ static_detour! {
 
 static CAPTURED_MANAGER: Mutex<Option<usize>> = Mutex::new(None);
 static BASE_ADDRESS: Mutex<Option<isize>> = Mutex::new(None);
+static GLOBAL_CHAIN: Mutex<Option<GlobalChain>> = Mutex::new(None);
 static DETOUR_ENABLED: AtomicBool = AtomicBool::new(false);
 static LAST_GAME_CMD: Mutex<Option<String>> = Mutex::new(None);
 static GAME_CALL_COUNT: Mutex<u64> = Mutex::new(0);
@@ -132,12 +136,14 @@ unsafe fn read_sso_string(ptr: *const u8) -> Option<String> {
     }
 }
 
-/// Reads the manager pointer from the global pointer chain.
+/// Reads the manager pointer from the global pointer chain. Returns None when
+/// no chain is known for this build or any step of the chain fails validation.
 unsafe fn read_pointers_from_global(base_address: isize) -> Option<usize> {
+    let chain = (*GLOBAL_CHAIN.lock().unwrap())?;
     unsafe {
         let base = base_address as *const u8;
 
-        let global_ptr = base.offset(GLOBAL_PTR_RVA) as *const *const u8;
+        let global_ptr = base.add(chain.global_ptr) as *const *const u8;
         let obj = *global_ptr;
         if obj.is_null() {
             return None;
@@ -150,7 +156,7 @@ unsafe fn read_pointers_from_global(base_address: isize) -> Option<usize> {
 
         // Verify cmdContext vtable
         let ctx_vtable = *(context as *const usize);
-        let expected_ctx_vtable = base_address as usize + CONTEXT_VTABLE_RVA as usize;
+        let expected_ctx_vtable = base_address as usize + chain.context_vtable;
         if ctx_vtable != expected_ctx_vtable {
             return None;
         }
@@ -162,7 +168,7 @@ unsafe fn read_pointers_from_global(base_address: isize) -> Option<usize> {
 
         // Verify cmdManager vtable
         let mgr_vtable = *(manager as *const usize);
-        let expected_mgr_vtable = base_address as usize + MANAGER_VTABLE_RVA as usize;
+        let expected_mgr_vtable = base_address as usize + chain.manager_vtable;
         if mgr_vtable != expected_mgr_vtable {
             return None;
         }
@@ -171,42 +177,56 @@ unsafe fn read_pointers_from_global(base_address: isize) -> Option<usize> {
     }
 }
 
-pub fn begin_detour(base_address: isize) {
+/// Installs the cmd_dispatch detour. `cmd_dispatch_rva` comes from the offset
+/// table; `chain` is optional and only needed for sending without a prior
+/// game call having populated the manager pointer.
+pub fn begin_detour(
+    base_address: isize,
+    cmd_dispatch_rva: u64,
+    chain: Option<GlobalChain>,
+) -> Result<(), String> {
     *BASE_ADDRESS.lock().unwrap() = Some(base_address);
+    *GLOBAL_CHAIN.lock().unwrap() = chain;
 
     // Try to read manager from the global chain immediately
-    unsafe {
-        if let Some(manager) = read_pointers_from_global(base_address) {
-            *CAPTURED_MANAGER.lock().unwrap() = Some(manager);
-            submit_message(CaptureMessage::Info(format!(
-                "cmd_dispatch manager from global: 0x{:x}",
-                manager
-            )));
-        } else {
-            submit_message(CaptureMessage::Info(
-                "cmd_dispatch global chain not yet populated, will capture from hook".to_string(),
-            ));
+    if chain.is_some() {
+        unsafe {
+            if let Some(manager) = read_pointers_from_global(base_address) {
+                *CAPTURED_MANAGER.lock().unwrap() = Some(manager);
+                submit_message(CaptureMessage::Info(format!(
+                    "cmd_dispatch manager from global: 0x{:x}",
+                    manager
+                )));
+            } else {
+                submit_message(CaptureMessage::Info(
+                    "cmd_dispatch global chain not yet populated, will capture from hook"
+                        .to_string(),
+                ));
+            }
         }
+    } else {
+        submit_message(CaptureMessage::Info(
+            "cmd_dispatch global chain unknown for this build, will capture manager from hook"
+                .to_string(),
+        ));
     }
 
+    let target_address = base_address as usize + cmd_dispatch_rva as usize;
     unsafe {
-        let target: extern "C" fn(*mut u8, *mut u8, *mut u8) =
-            mem::transmute(base_address + CMD_DISPATCH_RELATIVE_ADDRESS);
-        match CmdDispatchHook.initialize(target, cmd_dispatch_detour) {
-            Ok(_) => {
-                submit_message(CaptureMessage::Info(
-                    "cmd_dispatch detour initialized".to_string(),
-                ));
-                CmdDispatchHook.enable().unwrap();
-                DETOUR_ENABLED.store(true, Ordering::Relaxed);
-            }
-            Err(_) => {
-                submit_message(CaptureMessage::CaptureError(
-                    "Failed to initialize cmd_dispatch detour".to_string(),
-                ));
-            }
-        }
+        let target: extern "C" fn(*mut u8, *mut u8, *mut u8) = mem::transmute(target_address);
+        CmdDispatchHook
+            .initialize(target, cmd_dispatch_detour)
+            .map_err(|e| format!("initialize failed: {:?}", e))?;
+        CmdDispatchHook
+            .enable()
+            .map_err(|e| format!("enable failed: {:?}", e))?;
     }
+    DETOUR_ENABLED.store(true, Ordering::Relaxed);
+    submit_message(CaptureMessage::Info(format!(
+        "cmd_dispatch detour initialized at 0x{:x}",
+        target_address
+    )));
+    Ok(())
 }
 
 fn cmd_dispatch_detour(
@@ -351,7 +371,7 @@ pub fn get_diagnostics() -> DiagnosticsInfo {
 
 pub fn end_detour() {
     unsafe {
-        CmdDispatchHook.disable().unwrap();
+        let _ = CmdDispatchHook.disable();
     }
     DETOUR_ENABLED.store(false, Ordering::Relaxed);
 }

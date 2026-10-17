@@ -34,7 +34,7 @@ pub fn push_incoming_message_hash(channel: SwtorChannel, hash: u64) {
 fn post_message(msg_type: u32, wparam: usize, millis: u64) {
     if let Some(hwnd) = swtor_hook::get_hwnd() {
         unsafe {
-            let _ = PostMessageW(hwnd, msg_type, WPARAM(wparam), LPARAM(0));
+            let _ = PostMessageW(Some(hwnd), msg_type, WPARAM(wparam), LPARAM(0));
         }
 
         if millis > 0 {
@@ -46,7 +46,7 @@ fn post_message(msg_type: u32, wparam: usize, millis: u64) {
 fn send_message(msg_type: u32, wparam: usize, millis: u64) {
     if let Some(hwnd) = swtor_hook::get_hwnd() {
         unsafe {
-            let _ = SendMessageW(hwnd, msg_type, WPARAM(wparam), LPARAM(0));
+            let _ = SendMessageW(hwnd, msg_type, Some(WPARAM(wparam)), Some(LPARAM(0)));
         }
 
         if millis > 0 {

@@ -6,11 +6,12 @@ use sha2::{Digest, Sha256};
 
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{error, info, debug};
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, MAX_PATH};
+use windows::Win32::Foundation::{HWND, LPARAM, MAX_PATH};
+use windows::core::BOOL;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -26,11 +27,38 @@ use crate::comms::{self, FromService};
 pub mod message_hash_container;
 pub mod post;
 
-static SWTOR_HWND: Mutex<Option<HWND>> = Mutex::new(None);
+// Stored as isize: `HWND` wraps a raw pointer since windows 0.53 and is not `Send`.
+static SWTOR_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static SWTOR_PID: Mutex<Option<u32>> = Mutex::new(None);
 
 static PROCESS_CHECKSUM: OnceLock<Vec<u8>> = OnceLock::new();
 static PROCESS_IS_ACCESSIBLE: AtomicBool = AtomicBool::new(true);
+static LAST_CHECKSUM_ERROR_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+const CHECKSUM_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Environment variable the launcher may set with an alternative path to
+/// swtor.exe (e.g. `Z:\mnt\...\swtor.exe` under Proton, where the game's
+/// own `S:` drive letter can be missing from the prefix).
+pub const SWTOR_EXE_FALLBACK_ENV: &str = "CHATOR_SWTOR_EXE";
+
+/// Logs checksum failures at ERROR the first time and then every 30s; DEBUG in between.
+fn log_checksum_failure(message: String) {
+    let mut last = LAST_CHECKSUM_ERROR_LOG.lock().unwrap();
+    let due = last.map(|t| t.elapsed() >= CHECKSUM_ERROR_LOG_INTERVAL).unwrap_or(true);
+    if due {
+        error!("{}", message);
+        *last = Some(Instant::now());
+    } else {
+        debug!("{}", message);
+    }
+}
+
+fn hash_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let program_bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&program_bytes);
+    Ok(hasher.finalize().to_vec())
+}
 
 const ACCESS_IS_DENIED: i32 = 0x80070005u32 as i32;
 const PROCESS_NAME: &str = "Star Wars™: The Old Republic™";
@@ -63,7 +91,7 @@ pub fn set_process_checksum() {
         }
     };
 
-    info!("Attempting to compute SWTOR process checksum (pid: {})", pid);
+    debug!("Attempting to compute SWTOR process checksum (pid: {})", pid);
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
@@ -89,21 +117,41 @@ pub fn set_process_checksum() {
         ) {
             Ok(_) => {
                 let path_str = String::from_utf16(&buffer).unwrap().replace("\0", "");
-                info!("SWTOR executable path: {}", path_str);
-                let path = Path::new(&path_str);
+                debug!("SWTOR executable path (from process): {}", path_str);
 
-                match fs::read(path) {
-                    Ok(program_bytes) => {
-                        let mut hasher = Sha256::new();
-                        hasher.update(&program_bytes);
-                        let checksum = hasher.finalize().to_vec();
-                        info!("SWTOR checksum computed: {:X?}", &checksum[..8]);
-                        let _ = PROCESS_CHECKSUM.set(checksum);
-                    }
-                    Err(e) => {
-                        error!("Failed to read SWTOR executable at {}: {}", path_str, e);
+                // Candidate paths: the one the process reports, then the
+                // launcher-provided fallback.
+                let mut candidates: Vec<(String, &str)> = vec![(path_str.clone(), "process image path")];
+                if let Ok(fallback) = std::env::var(SWTOR_EXE_FALLBACK_ENV) {
+                    if !fallback.trim().is_empty() {
+                        candidates.push((fallback, SWTOR_EXE_FALLBACK_ENV));
                     }
                 }
+
+                let mut failures = Vec::new();
+                for (candidate, origin) in &candidates {
+                    match hash_file(Path::new(candidate)) {
+                        Ok(checksum) => {
+                            info!(
+                                "SWTOR checksum computed from {} ({}): {}",
+                                candidate,
+                                origin,
+                                checksum.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                            );
+                            let _ = PROCESS_CHECKSUM.set(checksum);
+                            return;
+                        }
+                        Err(e) => failures.push(format!("{} ({}): {}", candidate, origin, e)),
+                    }
+                }
+
+                let message = format!(
+                    "Failed to read swtor.exe for checksum. Tried: {}. Under Proton this usually means the game's drive letter (e.g. S:) is missing from the prefix; the launcher should pass STEAM_COMPAT_LIBRARY_PATHS/STEAM_COMPAT_INSTALL_PATH and {}.",
+                    failures.join("; "),
+                    SWTOR_EXE_FALLBACK_ENV
+                );
+                log_checksum_failure(message.clone());
+                comms::notify_once("error", message);
             }
             Err(e) => {
                 error!("QueryFullProcessImageNameW failed: {}", e);
@@ -132,7 +180,7 @@ extern "system" fn enum_windows_existing_proc(hwnd: HWND, _param1: LPARAM) -> BO
             GetWindowThreadProcessId(hwnd, Some(&mut process_id as *mut u32));
 
             SWTOR_PID.lock().unwrap().replace(process_id);
-            SWTOR_HWND.lock().unwrap().replace(hwnd);
+            SWTOR_HWND.lock().unwrap().replace(hwnd.0 as isize);
             set_process_checksum();
 
             return BOOL(0);
@@ -153,9 +201,9 @@ pub fn hook_into_existing() {
 }
 
 pub fn window_in_focus() -> bool {
-    if let Some(hwnd) = SWTOR_HWND.lock().unwrap().as_ref() {
+    if let Some(hwnd) = get_hwnd() {
         unsafe {
-            return GetForegroundWindow() == *hwnd;
+            return GetForegroundWindow() == hwnd;
         }
     }
 
@@ -167,7 +215,10 @@ pub fn get_pid() -> Option<u32> {
 }
 
 pub fn get_hwnd() -> Option<HWND> {
-    SWTOR_HWND.lock().unwrap().clone()
+    SWTOR_HWND
+        .lock()
+        .unwrap()
+        .map(|raw| HWND(raw as *mut core::ffi::c_void))
 }
 
 pub fn checksum_match(checksum: &[u8; 32]) -> Result<bool, &'static str> {
@@ -176,6 +227,13 @@ pub fn checksum_match(checksum: &[u8; 32]) -> Result<bool, &'static str> {
     }
 
     return Err("PROCESS_CHECKSUM not yet initialized");
+}
+
+/// Lowercase hex SHA256 of the running swtor.exe, if computed.
+pub fn checksum_hex() -> Option<String> {
+    PROCESS_CHECKSUM
+        .get()
+        .map(|c| c.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 pub fn is_hooked_in() -> bool {
@@ -197,6 +255,7 @@ pub fn start_swtor_hook() {
             }
             debug!("Sending IsHookedIn({})", hooked_in);
             comms::send(FromService::IsHookedIn(hooked_in));
+            crate::capture_injector::retry_if_needed();
             thread::sleep(Duration::from_millis(1000));
         }
     });

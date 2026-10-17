@@ -13,13 +13,13 @@ use std::{
 use syringe_container::SyringeContainer;
 use tracing::{debug, error, info};
 
-use chator_macros::sha256_to_array;
 use dll_syringe::{Syringe, process::OwnedProcess};
 use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, Value};
 
 use crate::comms::{self, FromService};
 use crate::share::dll_command::{DllCommand, DllResponse};
+use crate::share::offsets::HookReport;
 use crate::{share::CaptureMessage, swtor_hook};
 
 pub mod message_container;
@@ -27,13 +27,49 @@ mod syringe_container;
 
 use self::message_container::{CapturedMessage, SwtorMessageContainer};
 
-const SUPPORTED_SWTOR_CHECKSUM: [u8; 32] =
-    sha256_to_array!("584261b3cde36978175efb6e3b5dde4026ca17bb4138cf8fa49637dcb673524e");
-
 static MESSAGE_CONTAINER: LazyLock<Mutex<SwtorMessageContainer>> =
     LazyLock::new(|| Mutex::new(SwtorMessageContainer::new()));
 
 static INJECTED: AtomicBool = AtomicBool::new(false);
+/// Set when injection failed for a reason that will not fix itself (e.g. the
+/// build is not in the offset table). Cleared by `allow_retries()`.
+static RETRY_BLOCKED: AtomicBool = AtomicBool::new(false);
+static LAST_RETRY: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// How often the hook loop re-attempts injection while chat logging is on.
+pub const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub fn is_injected() -> bool {
+    INJECTED.load(Ordering::SeqCst)
+}
+
+pub fn allow_retries() {
+    RETRY_BLOCKED.store(false, Ordering::SeqCst);
+}
+
+/// Called once a second by the SWTOR watcher. Re-attempts injection when chat
+/// logging is on, nothing is injected yet, and the last failure was transient.
+pub fn retry_if_needed() {
+    if !comms::state::capture_chat_log() || is_injected() || RETRY_BLOCKED.load(Ordering::SeqCst) {
+        return;
+    }
+    if swtor_hook::get_pid().is_none() {
+        return;
+    }
+    {
+        let mut last = LAST_RETRY.lock().unwrap();
+        if let Some(t) = *last {
+            if t.elapsed() < RETRY_INTERVAL {
+                return;
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    info!("Chat logging is on but nothing is injected; retrying injection");
+    match start_injecting_capture() {
+        Ok(()) => info!("Capture injection started on retry"),
+        Err(e) => error!("Capture injection retry failed: {:?}", e),
+    }
+}
 static CONTINUE_LOGGING: AtomicBool = AtomicBool::new(false);
 
 struct DllConnection {
@@ -105,6 +141,48 @@ pub fn send_diagnostics() -> Result<crate::share::dll_command::DiagnosticsInfo, 
     }
 }
 
+/// Asks the DLL to install its hooks and returns what it managed to do.
+fn install_hooks_in_dll(
+    sha256: Option<String>,
+    offsets: std::collections::BTreeMap<String, u64>,
+    dynamic_lookup: bool,
+) -> Result<HookReport, String> {
+    let mut guard = DLL_CONNECTION
+        .lock()
+        .map_err(|_| "Lock poisoned".to_string())?;
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "DLL not connected".to_string())?;
+
+    let cmd = DllCommand::InstallHooks {
+        sha256,
+        offsets,
+        dynamic_lookup,
+    };
+    let mut json = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+    json.push('\n');
+    conn.writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
+    conn.writer
+        .flush()
+        .map_err(|e| format!("Flush failed: {}", e))?;
+
+    let mut line = String::new();
+    use std::io::BufRead;
+    conn.reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Read failed: {}", e))?;
+
+    let resp: DllResponse =
+        serde_json::from_str(line.trim()).map_err(|e| format!("Parse response failed: {}", e))?;
+
+    match resp {
+        DllResponse::InstallHooksResult(report) => Ok(report),
+        _ => Err("Unexpected response type".to_string()),
+    }
+}
+
 pub fn send_chat_command(command: &str, message: &str) -> Result<(), String> {
     let mut guard = DLL_CONNECTION
         .lock()
@@ -169,24 +247,67 @@ pub fn start_injecting_capture() -> Result<(), CaptureError> {
     let swtor_pid = swtor_pid.unwrap();
     info!("Found SWTOR process (pid: {})", swtor_pid);
 
-    match swtor_hook::checksum_match(&SUPPORTED_SWTOR_CHECKSUM) {
-        Ok(true) => info!("SWTOR checksum matches supported version"),
-        Ok(false) => {
-            error!("SWTOR checksum does not match supported version");
-            return Err(CaptureError::UnsupportedVersion);
-        }
-        Err(e) => {
-            error!("Could not verify SWTOR checksum: {:?}", e);
+    let sha256 = match swtor_hook::checksum_hex() {
+        Some(sha) => sha,
+        None => {
+            error!("Could not verify SWTOR checksum: not yet computed (see swtor_hook errors above)");
+            comms::notify_once(
+                "warn",
+                "Chat logging is waiting: the swtor.exe checksum could not be computed yet. See chator-service.log for the path that failed.",
+            );
+            INJECTED.store(false, Ordering::Relaxed);
             return Err(CaptureError::NotYetFullyReady);
         }
-    }
+    };
+
+    let dynamic_lookup = comms::state::dynamic_offset_lookup();
+    let table = comms::state::offset_table();
+    let offsets = match table.find(&sha256) {
+        Some(v) => {
+            info!(
+                "SWTOR build {} found in offset table ({}), {} offset(s)",
+                sha256,
+                v.label.as_deref().unwrap_or("unlabelled"),
+                v.offsets.len()
+            );
+            v.offsets.clone()
+        }
+        None if dynamic_lookup => {
+            info!(
+                "SWTOR build {} not in offset table; continuing with dynamic lookup only",
+                sha256
+            );
+            Default::default()
+        }
+        None => {
+            error!(
+                "SWTOR build {} not in offset table and dynamic lookup is disabled",
+                sha256
+            );
+            comms::notify_once(
+                "error",
+                format!(
+                    "Chat logging disabled: swtor.exe build {}… is not in the offsets table and dynamic offset lookup is off.",
+                    &sha256[..12]
+                ),
+            );
+            RETRY_BLOCKED.store(true, Ordering::SeqCst);
+            INJECTED.store(false, Ordering::Relaxed);
+            return Err(CaptureError::UnsupportedVersion);
+        }
+    };
 
     info!("Starting injection thread for pid {}", swtor_pid);
-    start_injecting_thread(swtor_pid);
+    start_injecting_thread(swtor_pid, sha256, offsets, dynamic_lookup);
     Ok(())
 }
 
-fn start_injecting_thread(swtor_pid: u32) {
+fn start_injecting_thread(
+    swtor_pid: u32,
+    sha256: String,
+    offsets: std::collections::BTreeMap<String, u64>,
+    dynamic_lookup: bool,
+) {
     thread::spawn(move || {
         info!("Injection thread started for pid {}", swtor_pid);
         CONTINUE_LOGGING.store(true, Ordering::Relaxed);
@@ -225,6 +346,33 @@ fn start_injecting_thread(swtor_pid: u32) {
         info!("Module listening on {}", module_port);
 
         connect_to_dll(module_port);
+
+        match install_hooks_in_dll(Some(sha256), offsets, dynamic_lookup) {
+            Ok(report) => {
+                if report.installed_count() == report.hooks.len() {
+                    info!("All hooks installed: {}", report.summary());
+                } else {
+                    error!(
+                        "{} of {} hooks installed: {}",
+                        report.installed_count(),
+                        report.hooks.len(),
+                        report.summary()
+                    );
+                }
+                for h in &report.hooks {
+                    info!(
+                        "  hook {}: rva={:?} source={:?} installed={} {}",
+                        h.name,
+                        h.rva.map(|r| format!("0x{:x}", r)),
+                        h.source,
+                        h.installed,
+                        h.detail.as_deref().unwrap_or("")
+                    );
+                }
+                comms::send(FromService::HookReport(report));
+            }
+            Err(e) => error!("InstallHooks failed: {}", e),
+        }
 
         let tcp_thread = thread::spawn(move || {
             start_tcp_listener_loop(listener);

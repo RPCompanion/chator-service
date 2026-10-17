@@ -5,32 +5,29 @@ use crate::lib_only::submit_message;
 use crate::share::CaptureMessage;
 use crate::share::raw_swtor_message::RawSwtorMessage;
 
-const CHAT_RELATIVE_ADDRESS: isize = 0x0521cc0;
-
 // chat_recv(param_1, from_sso, to_sso, channel_id, msg_sso)
 // All string params are 16-byte EA SSO string pointers. Returns void.
 static_detour! {
     static ChatHook: extern "C" fn(*mut u8, *const u8, *const u8, i32, *const u8);
 }
 
-pub fn begin_detour(base_address: isize) {
+/// Installs the chat receive detour at an absolute address.
+pub fn begin_detour(target_address: usize) -> Result<(), String> {
     unsafe {
         let target: extern "C" fn(*mut u8, *const u8, *const u8, i32, *const u8) =
-            mem::transmute(base_address + CHAT_RELATIVE_ADDRESS);
-        match ChatHook.initialize(target, receive_chat_message_detour) {
-            Ok(_) => {
-                submit_message(CaptureMessage::Info(
-                    "Chat Message detour initialized".to_string(),
-                ));
-                ChatHook.enable().unwrap();
-            }
-            Err(_) => {
-                submit_message(CaptureMessage::CaptureError(
-                    "Failed to initialize chat message detour".to_string(),
-                ));
-            }
-        }
+            mem::transmute(target_address);
+        ChatHook
+            .initialize(target, receive_chat_message_detour)
+            .map_err(|e| format!("initialize failed: {:?}", e))?;
+        ChatHook
+            .enable()
+            .map_err(|e| format!("enable failed: {:?}", e))?;
     }
+    submit_message(CaptureMessage::Info(format!(
+        "Chat Message detour initialized at 0x{:x}",
+        target_address
+    )));
+    Ok(())
 }
 
 fn receive_chat_message_detour(
@@ -54,6 +51,6 @@ fn receive_chat_message_detour(
 
 pub fn end_detour() {
     unsafe {
-        ChatHook.disable().unwrap();
+        let _ = ChatHook.disable();
     }
 }

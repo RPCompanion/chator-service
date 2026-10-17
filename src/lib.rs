@@ -5,9 +5,11 @@ mod utils;
 
 mod lib_only;
 
+use std::collections::BTreeMap;
 use std::io::prelude::*;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use std::str;
@@ -17,8 +19,10 @@ use std::time::Duration;
 use lib_only::chat_message;
 use lib_only::cmd_dispatch;
 use lib_only::dice_roll;
+use lib_only::sigscan;
 
 use share::CaptureMessage;
+use share::offsets::{HookReport, HookStatus, OffsetSource, names};
 
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows::core::PCSTR;
@@ -33,6 +37,8 @@ static QUIT: AtomicBool = AtomicBool::new(false);
 static CHATOR_PORT: AtomicU16 = AtomicU16::new(0);
 // TcpListener port for this injected module
 static LOCAL_PORT: AtomicU16 = AtomicU16::new(0);
+// Result of the last (and only) hook installation; hooks are installed once per injection.
+static HOOK_REPORT: Mutex<Option<HookReport>> = Mutex::new(None);
 
 #[unsafe(no_mangle)]
 extern "system" fn capture_module_initalized() -> bool {
@@ -71,9 +77,8 @@ extern "system" fn init_capture_module(chator_port: u16) -> u16 {
         return 0;
     }
 
-    unsafe {
-        begin_hook();
-    }
+    // Hooks are installed when the service sends DllCommand::InstallHooks with
+    // the offsets for this build; see install_hooks().
 
     port
 }
@@ -170,6 +175,19 @@ fn start_command_listener(listener: TcpListener) {
                         let _ = writer.flush();
                     }
                 }
+                Ok(share::dll_command::DllCommand::InstallHooks {
+                    sha256,
+                    offsets,
+                    dynamic_lookup,
+                }) => {
+                    let report = install_hooks(sha256, &offsets, dynamic_lookup);
+                    let response = share::dll_command::DllResponse::InstallHooksResult(report);
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let _ = writer.write_all(json.as_bytes());
+                        let _ = writer.write_all(b"\n");
+                        let _ = writer.flush();
+                    }
+                }
                 Ok(share::dll_command::DllCommand::Diagnostics) => {
                     let info = cmd_dispatch::get_diagnostics();
                     let response = share::dll_command::DllResponse::DiagnosticsResult(info);
@@ -196,28 +214,179 @@ fn start_command_listener(listener: TcpListener) {
     });
 }
 
-fn begin_hook() {
-    unsafe {
+/// Installs all hooks once. Later calls (e.g. after the service restarts while
+/// the DLL stays injected) return the report from the first installation.
+fn install_hooks(
+    sha256: Option<String>,
+    offsets: &BTreeMap<String, u64>,
+    dynamic_lookup: bool,
+) -> HookReport {
+    if let Some(existing) = HOOK_REPORT.lock().unwrap().as_ref() {
+        submit_message(CaptureMessage::Info(
+            "InstallHooks: hooks already installed, returning previous report".to_string(),
+        ));
+        return existing.clone();
+    }
+
+    let mut report = HookReport {
+        sha256,
+        dynamic_lookup,
+        hooks: Vec::new(),
+    };
+
+    let base_address = unsafe {
         match GetModuleHandleA(PCSTR(b"swtor.exe\0".as_ptr())) {
-            Ok(hmodule) => {
-                submit_message(CaptureMessage::Info("Found module".to_string()));
-                submit_message(CaptureMessage::Info(format!(
-                    "Module handle: {:?}",
-                    hmodule
+            Ok(hmodule) => hmodule.0 as isize,
+            Err(e) => {
+                submit_message(CaptureMessage::CaptureError(format!(
+                    "Failed to find swtor.exe module: {:?}",
+                    e
                 )));
-                begin_detours(hmodule.0);
-            }
-            Err(_) => {
-                submit_message(CaptureMessage::Info("Failed to find module".to_string()));
+                for name in [names::CHAT_RECV, names::ROLL_HANDLER, names::CMD_DISPATCH] {
+                    report.hooks.push(HookStatus {
+                        name: name.to_string(),
+                        rva: None,
+                        source: OffsetSource::None,
+                        installed: false,
+                        detail: Some("swtor.exe module handle not found".to_string()),
+                    });
+                }
+                *HOOK_REPORT.lock().unwrap() = Some(report.clone());
+                return report;
             }
         }
-    }
-}
+    };
+    submit_message(CaptureMessage::Info(format!(
+        "Installing hooks, module base 0x{:x}, dynamic_lookup={}, table offsets: {:?}",
+        base_address, dynamic_lookup, offsets
+    )));
 
-fn begin_detours(base_address: isize) {
-    chat_message::begin_detour(base_address);
-    dice_roll::begin_detour(base_address);
-    cmd_dispatch::begin_detour(base_address);
+    // ---- chat_recv: dynamic lookup first, table as fallback ----
+    {
+        let table_rva = offsets.get(names::CHAT_RECV).copied();
+        let mut rva = None;
+        let mut source = OffsetSource::None;
+        let mut detail: Vec<String> = Vec::new();
+
+        if dynamic_lookup {
+            match unsafe { sigscan::find_chat_recv(base_address as usize) } {
+                Ok(hit) => {
+                    rva = Some(hit.rva as u64);
+                    source = OffsetSource::Dynamic;
+                    detail.push(format!("scan: {}", hit.detail));
+                    if let Some(t) = table_rva {
+                        if t != hit.rva as u64 {
+                            detail.push(format!(
+                                "table offset 0x{:x} differs from scan result 0x{:x}; using scan",
+                                t, hit.rva
+                            ));
+                        }
+                    }
+                }
+                Err(e) => detail.push(format!("scan failed: {}", e)),
+            }
+        }
+        if rva.is_none() {
+            if let Some(t) = table_rva {
+                rva = Some(t);
+                source = OffsetSource::Table;
+            } else {
+                detail.push("no table offset for this build".to_string());
+            }
+        }
+
+        let installed = match rva {
+            Some(r) => match chat_message::begin_detour(base_address as usize + r as usize) {
+                Ok(()) => true,
+                Err(e) => {
+                    detail.push(e);
+                    false
+                }
+            },
+            None => false,
+        };
+        report.hooks.push(HookStatus {
+            name: names::CHAT_RECV.to_string(),
+            rva,
+            source,
+            installed,
+            detail: Some(detail.join("; ")),
+        });
+    }
+
+    // ---- roll_handler: table only ----
+    {
+        let rva = offsets.get(names::ROLL_HANDLER).copied();
+        let mut detail = None;
+        let installed = match rva {
+            Some(r) => match dice_roll::begin_detour(base_address as usize + r as usize) {
+                Ok(()) => true,
+                Err(e) => {
+                    detail = Some(e);
+                    false
+                }
+            },
+            None => {
+                detail = Some("no table offset for this build".to_string());
+                false
+            }
+        };
+        report.hooks.push(HookStatus {
+            name: names::ROLL_HANDLER.to_string(),
+            rva,
+            source: if rva.is_some() { OffsetSource::Table } else { OffsetSource::None },
+            installed,
+            detail,
+        });
+    }
+
+    // ---- cmd_dispatch: table only, with optional global chain ----
+    {
+        let rva = offsets.get(names::CMD_DISPATCH).copied();
+        let chain = match (
+            offsets.get(names::GLOBAL_PTR),
+            offsets.get(names::CONTEXT_VTABLE),
+            offsets.get(names::MANAGER_VTABLE),
+        ) {
+            (Some(g), Some(c), Some(m)) => Some(cmd_dispatch::GlobalChain {
+                global_ptr: *g as usize,
+                context_vtable: *c as usize,
+                manager_vtable: *m as usize,
+            }),
+            _ => None,
+        };
+        let mut detail = vec![format!(
+            "global chain {}",
+            if chain.is_some() { "from table" } else { "unavailable" }
+        )];
+        let installed = match rva {
+            Some(r) => match cmd_dispatch::begin_detour(base_address, r, chain) {
+                Ok(()) => true,
+                Err(e) => {
+                    detail.push(e);
+                    false
+                }
+            },
+            None => {
+                detail.push("no table offset for this build".to_string());
+                false
+            }
+        };
+        report.hooks.push(HookStatus {
+            name: names::CMD_DISPATCH.to_string(),
+            rva,
+            source: if rva.is_some() { OffsetSource::Table } else { OffsetSource::None },
+            installed,
+            detail: Some(detail.join("; ")),
+        });
+    }
+
+    submit_message(CaptureMessage::Info(format!(
+        "Hook installation finished: {}",
+        report.summary()
+    )));
+    *HOOK_REPORT.lock().unwrap() = Some(report.clone());
+    report
 }
 
 fn end_detours() {
