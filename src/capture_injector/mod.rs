@@ -485,13 +485,24 @@ fn start_logging_propagation() {
 }
 
 pub fn stop_injecting_capture() {
+    stop_injecting_capture_with_timeout(Duration::from_secs(30));
+}
+
+/// Asks the injection thread to stop (DllCommand::Stop + eject) and waits up to
+/// `timeout` for it to finish.
+pub fn stop_injecting_capture_with_timeout(timeout: Duration) {
     if !INJECTED.load(Ordering::Relaxed) {
         return;
     }
 
     CONTINUE_LOGGING.store(false, Ordering::Relaxed);
 
+    let started = std::time::Instant::now();
     while INJECTED.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(1));
+        if started.elapsed() > timeout {
+            error!("Timed out waiting for capture to stop after {:?}", timeout);
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
     }
 }

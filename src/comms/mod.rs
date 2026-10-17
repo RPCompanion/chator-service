@@ -88,15 +88,53 @@ pub fn init(stream: TcpStream) {
 }
 
 /// Sends a message to the client.
+static SEND_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Consecutive send failures before we conclude the client is gone.
+const MAX_SEND_FAILURES: u32 = 3;
+
 pub fn send(msg: FromService) {
-    let mut guard = WRITE_STREAM.lock().unwrap();
-    if let Some(ref mut stream) = *guard {
-        let mut json = serde_json::to_string(&msg).unwrap();
-        json.push('\n');
-        if let Err(e) = stream.write_all(json.as_bytes()) {
-            error!("Failed to send message to client: {}", e);
+    use std::sync::atomic::Ordering;
+    let failures = {
+        let mut guard = WRITE_STREAM.lock().unwrap();
+        match *guard {
+            Some(ref mut stream) => {
+                let mut json = serde_json::to_string(&msg).unwrap();
+                json.push('\n');
+                match stream.write_all(json.as_bytes()) {
+                    Ok(()) => {
+                        SEND_FAILURES.store(0, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(e) => {
+                        error!("Failed to send message to client: {}", e);
+                        SEND_FAILURES.fetch_add(1, Ordering::Relaxed) + 1
+                    }
+                }
+            }
+            None => return,
         }
+    };
+    if failures >= MAX_SEND_FAILURES {
+        shutdown("client connection lost");
     }
+}
+
+/// Stops capture (tells the DLL to remove its hooks and ejects it) and exits
+/// the process. Used when ChaTOR disconnects or stops answering; without it a
+/// stale service kept running under Wine, holding the DLL's command channel.
+pub fn shutdown(reason: &str) {
+    use std::sync::atomic::Ordering;
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let reason = reason.to_string();
+    std::thread::spawn(move || {
+        info!("Shutting down: {}", reason);
+        crate::capture_injector::stop_injecting_capture_with_timeout(Duration::from_secs(10));
+        info!("Shutdown complete");
+        std::process::exit(0);
+    });
 }
 
 /// Blocking read loop — reads FromClient messages and dispatches them.

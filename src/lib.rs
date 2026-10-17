@@ -67,6 +67,9 @@ extern "system" fn init_capture_module(chator_port: u16) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
+    // May be a re-initialisation after DllCommand::Stop (hooks removed, state
+    // reset) when the eject did not unload the module.
+    QUIT.store(false, Ordering::Relaxed);
     CHATOR_PORT.store(chator_port, Ordering::Relaxed);
     LOCAL_PORT.store(port, Ordering::Relaxed);
 
@@ -146,26 +149,38 @@ fn set_panic_hook() {
     }));
 }
 
+/// Serves DllCommands from the service, one connection at a time. A dropped
+/// connection (the service died or ChaTOR restarted) keeps the hooks installed
+/// and goes back to accepting, so the next service can reconnect and pick up
+/// where the last one left off. Only an explicit `Stop` removes the hooks.
 fn start_command_listener(listener: TcpListener) {
     thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let write_stream = stream.try_clone().unwrap();
-        let reader = std::io::BufReader::new(stream);
-        let mut writer = std::io::BufWriter::new(write_stream);
-
-        use std::io::BufRead;
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
+        'accept: loop {
+            let (stream, _) = match listener.accept() {
+                Ok(s) => s,
                 Err(_) => break,
             };
+            submit_message(CaptureMessage::Info("Service connected to DLL command port".to_string()));
+            let write_stream = match stream.try_clone() {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            let reader = std::io::BufReader::new(stream);
+            let mut writer = std::io::BufWriter::new(write_stream);
 
-            if line.trim().is_empty() {
-                continue;
-            }
+            use std::io::BufRead;
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
 
-            match serde_json::from_str::<share::dll_command::DllCommand>(&line) {
-                Ok(share::dll_command::DllCommand::Stop) => break,
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                match serde_json::from_str::<share::dll_command::DllCommand>(&line) {
+                Ok(share::dll_command::DllCommand::Stop) => break 'accept,
                 Ok(share::dll_command::DllCommand::SendChatCommand { command, message }) => {
                     let result = cmd_dispatch::send_command(&command, &message);
                     let response = share::dll_command::DllResponse::SendChatResult(result);
@@ -199,18 +214,26 @@ fn start_command_listener(listener: TcpListener) {
                 }
                 Err(_) => {
                     if line.trim() == "stop" {
-                        break;
+                        break 'accept;
                     }
                     submit_message(CaptureMessage::Error(format!(
                         "Invalid DLL command: {}",
                         line
                     )));
                 }
+                }
             }
+            // Connection dropped without Stop: keep hooks, wait for the next service.
+            submit_message(CaptureMessage::Info(
+                "Service disconnected from DLL command port; keeping hooks and waiting for reconnect".to_string(),
+            ));
         }
 
+        // Explicit Stop: tear everything down and let a later init start fresh.
         end_detours();
         QUIT.store(true, Ordering::Relaxed);
+        CHATOR_PORT.store(0, Ordering::Relaxed);
+        LOCAL_PORT.store(0, Ordering::Relaxed);
     });
 }
 
@@ -393,4 +416,6 @@ fn end_detours() {
     chat_message::end_detour();
     dice_roll::end_detour();
     cmd_dispatch::end_detour();
+    // Hooks are gone, so a later InstallHooks must really reinstall.
+    *HOOK_REPORT.lock().unwrap() = None;
 }

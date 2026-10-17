@@ -26,3 +26,10 @@ OUT="target/$TARGET/$PROFILE_DIR"
 echo
 echo "Built:"
 ls -l "$OUT/chator-service.exe" "$OUT/swtor_chat_capture.dll"
+
+# Make the build available to the ChaTOR app (config.toml points at
+# service/chator-service.exe; tauri.conf.json bundles the service/ folder).
+APP_SERVICE_DIR="$(cd .. && pwd)/ChaTOR/src-tauri/service"
+mkdir -p "$APP_SERVICE_DIR"
+cp -f "$OUT/chator-service.exe" "$OUT/swtor_chat_capture.dll" "$APP_SERVICE_DIR/"
+echo "Copied into $APP_SERVICE_DIR"

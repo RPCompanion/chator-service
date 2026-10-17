@@ -1,4 +1,6 @@
 use std::net::TcpStream;
+use std::thread;
+use std::time::Duration;
 
 use tracing::{error, info};
 
@@ -39,5 +41,9 @@ fn main() {
     // Blocking — runs until the connection drops
     comms::recv_loop(read_stream);
 
-    info!("Shutting down");
+    // Remove hooks / eject the DLL before exiting so the next service starts clean.
+    comms::shutdown("client disconnected");
+    thread::sleep(Duration::from_secs(15));
+    error!("Shutdown did not complete in time; exiting anyway");
+    std::process::exit(1);
 }

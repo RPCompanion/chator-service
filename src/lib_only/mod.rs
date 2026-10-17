@@ -10,9 +10,15 @@ pub mod friends_list;
 pub mod sigscan;
 
 static MESSAGES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// Messages buffered while no service is connected; oldest are dropped past this.
+const MAX_QUEUED_MESSAGES: usize = 5000;
 
 pub fn submit_message(capture_message: CaptureMessage) {
     let mut messages = MESSAGES.lock().unwrap();
+    if messages.len() >= MAX_QUEUED_MESSAGES {
+        let excess = messages.len() + 1 - MAX_QUEUED_MESSAGES;
+        messages.drain(..excess);
+    }
     messages.push(capture_message.as_json());
 }
 
