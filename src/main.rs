@@ -20,6 +20,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:30100".to_string());
 
+    info!("Service log directory: {}", logging::log_dir().display());
     info!("Connecting to ChaTOR at {}", address);
 
     let stream = match TcpStream::connect(&address) {

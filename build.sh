@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Builds chator-service (chator-service.exe + swtor_chat_capture.dll) for Windows.
+# Builds chator-service (chator-service.exe + swtor_chat_capture.dll) for Windows
+# from Linux, then copies both into the ChaTOR app so it bundles them.
 #
-# This is just `cargo build --target x86_64-pc-windows-msvc`. Everything that
-# makes cross-compiling work is configured next to this script:
-#   .cargo/config.toml   lld as linker, clang-cl for C deps, xwin CRT/SDK paths
-#   rust-toolchain.toml  nightly toolchain with the x86_64-pc-windows-msvc target
+# Cross-compiling uses cargo-xwin (cargo install --locked cargo-xwin, or
+# `uv tool install cargo-xwin`), which fetches the MSVC CRT/SDK on first use and
+# drives clang-cl / lld-link. Needs clang, lld and llvm on PATH.
+# rust-toolchain.toml pins nightly (retour uses unstable features).
 #
 # Usage:
 #   ./build.sh            debug build  -> target/x86_64-pc-windows-msvc/debug/
 #   ./build.sh --release  release build -> target/x86_64-pc-windows-msvc/release/
 # Any extra arguments are passed straight to cargo.
+#
+# CHATOR_APP_DIR overrides where the ChaTOR repo is (default: ../ChaTOR).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -20,7 +23,12 @@ for arg in "$@"; do
   [[ "$arg" == "--release" ]] && PROFILE_DIR=release
 done
 
-cargo build --target "$TARGET" "$@"
+if ! command -v cargo-xwin >/dev/null 2>&1; then
+  echo "cargo-xwin not found. Install it with: cargo install --locked cargo-xwin" >&2
+  exit 1
+fi
+
+cargo xwin build --target "$TARGET" "$@"
 
 OUT="target/$TARGET/$PROFILE_DIR"
 echo
@@ -29,7 +37,8 @@ ls -l "$OUT/chator-service.exe" "$OUT/swtor_chat_capture.dll"
 
 # Make the build available to the ChaTOR app (config.toml points at
 # service/chator-service.exe; tauri.conf.json bundles the service/ folder).
-APP_SERVICE_DIR="$(cd .. && pwd)/ChaTOR/src-tauri/service"
+APP_DIR="${CHATOR_APP_DIR:-$(cd .. && pwd)/ChaTOR}"
+APP_SERVICE_DIR="$APP_DIR/src-tauri/service"
 mkdir -p "$APP_SERVICE_DIR"
 cp -f "$OUT/chator-service.exe" "$OUT/swtor_chat_capture.dll" "$APP_SERVICE_DIR/"
 echo "Copied into $APP_SERVICE_DIR"
