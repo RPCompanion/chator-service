@@ -48,8 +48,14 @@ pub fn allow_retries() {
 
 /// Called once a second by the SWTOR watcher. Re-attempts injection when chat
 /// logging is on, nothing is injected yet, and the last failure was transient.
+/// Never during shutdown: a retry right after shutdown ejected the DLL used to
+/// inject it again and leave its hooks behind when the service exited.
 pub fn retry_if_needed() {
-    if !comms::state::capture_chat_log() || is_injected() || RETRY_BLOCKED.load(Ordering::SeqCst) {
+    if comms::is_shutting_down()
+        || !comms::state::capture_chat_log()
+        || is_injected()
+        || RETRY_BLOCKED.load(Ordering::SeqCst)
+    {
         return;
     }
     if swtor_hook::get_pid().is_none() {
@@ -327,6 +333,40 @@ fn start_injecting_thread(
 
         info!("DLL injection succeeded");
         let syringe_container = syringe_container.unwrap();
+
+        // ChaTOR may have been updated or rebuilt while the game kept an older DLL loaded:
+        // find_or_inject then reuses it, and its code would not match this service. Stop it (its
+        // hooks come out), eject it and load this build's DLL.
+        let syringe_container = if syringe_container.build_id() == Some(crate::share::BUILD_ID) {
+            syringe_container
+        } else {
+            info!(
+                "Loaded DLL is from another build ({:?}, this service is {}); replacing it",
+                syringe_container.build_id(),
+                crate::share::BUILD_ID
+            );
+            if syringe_container.capture_module_initalized() {
+                connect_to_dll(syringe_container.get_module_ports().local_port);
+                disconnect_dll();
+                thread::sleep(Duration::from_secs(1));
+            }
+            let fresh = match syringe_container.eject() {
+                Ok(()) => SyringeContainer::inject(&syringe).ok(),
+                Err(e) => {
+                    error!("Could not eject the old DLL: {:?}", e);
+                    None
+                }
+            };
+            match fresh {
+                Some(fresh) if fresh.build_id() == Some(crate::share::BUILD_ID) => fresh,
+                _ => {
+                    error!("Could not load this build's DLL");
+                    INJECTED.store(false, Ordering::Relaxed);
+                    CONTINUE_LOGGING.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let chator_port = listener.local_addr().unwrap().port();

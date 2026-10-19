@@ -3,6 +3,8 @@ use std::mem;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::lib_only::chat_gateway;
+use crate::lib_only::memory::{self, Regions};
 use crate::lib_only::sigscan::{self, ChainVtables};
 use crate::lib_only::submit_message;
 use crate::share::CaptureMessage;
@@ -54,12 +56,12 @@ static GAME_CALL_COUNT: Mutex<u64> = Mutex::new(0);
 /// Heap (len >= 16): bytes[0..7] = pointer, bytes[8..11] = u32 length,
 ///                   bytes[12..15] = capacity with high bit of byte[15] set (0x80).
 #[repr(C)]
-struct EaSsoString {
+pub(crate) struct EaSsoString {
     data: [u8; 16],
 }
 
 impl EaSsoString {
-    fn from_str(s: &str) -> Self {
+    pub(crate) fn from_str(s: &str) -> Self {
         let bytes = s.as_bytes();
         let len = bytes.len();
         let mut sso = EaSsoString { data: [0u8; 16] };
@@ -128,7 +130,7 @@ impl Drop for EaSsoString {
 }
 
 /// Read an SSO string from a raw pointer (for logging game calls).
-unsafe fn read_sso_string(ptr: *const u8) -> Option<String> {
+pub(crate) unsafe fn read_sso_string(ptr: *const u8) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
@@ -157,44 +159,6 @@ fn capture_manager(manager: usize) {
     let vtable = unsafe { *(manager as *const usize) };
     *CAPTURED_MANAGER.lock().unwrap() = Some(manager);
     *CAPTURED_VTABLE.lock().unwrap() = Some(vtable);
-}
-
-/// Readability of addresses, remembering the last region VirtualQuery described so that a scan
-/// over many pointers into the same heap region queries it once.
-#[derive(Default)]
-struct Regions {
-    start: usize,
-    end: usize,
-    readable: bool,
-}
-
-impl Regions {
-    /// Whether the 8 bytes at `address` are committed, readable memory.
-    fn readable(&mut self, address: usize) -> bool {
-        use windows::Win32::System::Memory::*;
-        if !(self.start..self.end).contains(&address) {
-            let mut info = MEMORY_BASIC_INFORMATION::default();
-            let size = unsafe {
-                VirtualQuery(Some(address as *const _), &mut info, mem::size_of::<MEMORY_BASIC_INFORMATION>())
-            };
-            if size == 0 {
-                return false;
-            }
-            let readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-            *self = Regions {
-                start: info.BaseAddress as usize,
-                end: info.BaseAddress as usize + info.RegionSize,
-                readable: info.State == MEM_COMMIT
-                    && (info.Protect & readable).0 != 0
-                    && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)).0 == 0,
-            };
-        }
-        self.readable && address + 8 <= self.end
-    }
-}
-
-unsafe fn is_readable(address: usize) -> bool {
-    Regions::default().readable(address)
 }
 
 /// Finds the `.data` global holding the OmegaClientApp object, the start of the chain: the first
@@ -265,7 +229,7 @@ fn live_manager() -> Result<usize, String> {
         }
         return Err("ChaTOR has not seen the game send a chat message yet. Post any /e from the game's chat box once, then try again.".to_string());
     };
-    if unsafe { is_readable(manager) && *(manager as *const usize) == vtable } {
+    if memory::read_usize(manager) == Some(vtable) {
         Ok(manager)
     } else {
         *CAPTURED_MANAGER.lock().unwrap() = None;
@@ -409,39 +373,42 @@ fn cmd_dispatch_detour(
     CmdDispatchHook.call(manager, cmd_name_sso, msg_sso);
 }
 
-fn resolve_command_name(cmd: &str) -> String {
-    let lower = cmd.to_ascii_lowercase();
-    let resolved = if lower == "e" || lower == "emote" || lower == "em" {
-        "emote"
-    } else if lower == "s" || lower == "say" {
-        "say"
-    } else if lower == "y" || lower == "yell" {
-        "yell"
-    } else if lower == "w" || lower == "whisper" || lower == "tell" {
-        "whisper"
-    } else if lower == "g" || lower == "guild" {
-        "guild"
-    } else if lower == "p" || lower == "party" || lower == "group" {
-        "group"
-    } else if lower == "o" || lower == "ops" {
-        "ops"
-    } else if lower == "general" {
-        "general"
-    } else if lower == "pvp" {
-        "pvp"
-    } else if lower == "trade" {
-        "trade"
-    } else if lower == "officer" || lower == "go" {
-        "officer"
-    } else {
-        return lower;
-    };
-    resolved.to_string()
+/// Where a chat command goes (frida-scripts/chat_send_routes_oct2026.md).
+enum Route {
+    /// cmd_dispatch on the area server, with the game's command name.
+    Dispatch(&'static str),
+    /// The chat gateway's channel message; the channel number as in chat_recv (SwtorChannel).
+    Channel(i32),
+    /// The chat gateway's whisper; the message is "name: text".
+    Whisper,
+}
+
+/// Commands as ChaTOR writes them (SwtorChannel.get_command) plus the game's long forms.
+fn route(command: &str) -> Option<Route> {
+    Some(match command.to_ascii_lowercase().as_str() {
+        "e" | "em" | "emote" => Route::Dispatch("emote"),
+        "s" | "say" => Route::Dispatch("say"),
+        "y" | "yell" => Route::Dispatch("yell"),
+        "w" | "whisper" | "tell" => Route::Whisper,
+        "1" | "general" => Route::Channel(51),
+        "2" | "pvp" => Route::Channel(52),
+        "3" | "trade" => Route::Channel(53),
+        "p" | "party" | "group" => Route::Channel(54),
+        "ops" => Route::Channel(55),
+        "oa" => Route::Channel(56),
+        "g" | "guild" => Route::Channel(57),
+        "o" | "officer" => Route::Channel(58),
+        "oo" => Route::Channel(61),
+        _ => return None,
+    })
 }
 
 /// SWTOR chat messages are limited to 255 characters.
 const MAX_MESSAGE_LEN: usize = 255;
 
+/// Sends `/command message` the way the game would: emote / say / yell through cmd_dispatch,
+/// channels and whispers through the chat gateway. Errors (without sending anything) for
+/// commands it cannot send directly or channels whose id is not known yet.
 pub fn send_command(command: &str, message: &str) -> Result<(), String> {
     if message.len() > MAX_MESSAGE_LEN {
         return Err(format!(
@@ -450,7 +417,28 @@ pub fn send_command(command: &str, message: &str) -> Result<(), String> {
             MAX_MESSAGE_LEN
         ));
     }
+    match route(command) {
+        Some(Route::Dispatch(name)) => dispatch(name, message),
+        Some(Route::Channel(channel)) => chat_gateway::send_channel(channel, message),
+        Some(Route::Whisper) => {
+            let (name, text) = message
+                .split_once(':')
+                .ok_or_else(|| "A whisper needs \"name: message\"".to_string())?;
+            chat_gateway::send_whisper(name.trim(), text.trim_start())
+        }
+        None => Err(format!("/{} cannot be sent directly", command)),
+    }
+}
 
+/// The OmegaClientApp object at the start of the global chain (the chat gateway hangs off it too).
+pub fn app_object() -> Option<usize> {
+    let base = (*BASE_ADDRESS.lock().unwrap())?;
+    resolve_global_chain(base);
+    let chain = (*GLOBAL_CHAIN.lock().unwrap())?;
+    memory::read_usize(base as usize + chain.global_ptr).filter(|&app| app != 0)
+}
+
+fn dispatch(name: &str, message: &str) -> Result<(), String> {
     // Re-read manager from global chain for freshness
     if let Some(base) = *BASE_ADDRESS.lock().unwrap() {
         resolve_global_chain(base);
@@ -463,15 +451,13 @@ pub fn send_command(command: &str, message: &str) -> Result<(), String> {
 
     let manager = live_manager()?;
 
-    let resolved = resolve_command_name(command);
-
     // Build 16-byte EA SSO strings for both cmd_name and message
-    let cmd_sso = EaSsoString::from_str(&resolved);
+    let cmd_sso = EaSsoString::from_str(name);
     let mut msg_sso = EaSsoString::from_str(message);
 
     submit_message(CaptureMessage::Info(format!(
         "send_command: cmd=\"{}\" msg=\"{}\", mgr=0x{:x}",
-        resolved,
+        name,
         msg_sso.as_str().unwrap_or_default(),
         manager,
     )));

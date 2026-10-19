@@ -191,34 +191,98 @@ impl PeImage {
     /// CompleteObjectLocator in `.rdata` that refers to it (signature 1, offset 0, its own RVA
     /// last), then the `.rdata` slot pointing at that locator, which sits right before the vtable.
     pub unsafe fn find_vtable_by_rtti(&self, class: &str) -> Result<u32, String> {
+        unsafe { self.find_subobject_vtable(class, 0) }
+    }
+
+    /// RVAs of the RTTI type descriptors named `.?AV<class>@@`.
+    unsafe fn type_descriptors(&self, class: &str) -> Result<Vec<u32>, String> {
         let name = format!(".?AV{class}@@\0");
         let data = self.section(".data").ok_or_else(|| ".data section not found".to_string())?;
+        let data_bytes = unsafe { self.section_bytes(data) };
+        // A type descriptor is a vtable pointer and a spare pointer, then the name.
+        Ok(find_all(data_bytes, name.as_bytes())
+            .filter_map(|at| (data.rva as usize + at).checked_sub(16).map(|d| d as u32))
+            .collect())
+    }
+
+    /// RVAs of the CompleteObjectLocators of `class` whose subobject offset is `offset`.
+    unsafe fn object_locators(&self, class: &str, offset: u32) -> Result<Vec<u32>, String> {
         let rdata = self.section(".rdata").ok_or_else(|| ".rdata section not found".to_string())?;
-        let (data_bytes, rdata_bytes) = unsafe { (self.section_bytes(data), self.section_bytes(rdata)) };
+        let rdata_bytes = unsafe { self.section_bytes(rdata) };
         let u32_at = |i: usize| u32::from_le_bytes(rdata_bytes[i..i + 4].try_into().unwrap());
+        let descriptors = unsafe { self.type_descriptors(class)? };
+        let mut out = Vec::new();
+        for col in (0..rdata_bytes.len().saturating_sub(24)).step_by(4) {
+            let col_rva = rdata.rva + col as u32;
+            if u32_at(col) == 1 && u32_at(col + 4) == offset && descriptors.contains(&u32_at(col + 12)) && u32_at(col + 20) == col_rva {
+                out.push(col_rva);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Like find_vtable_by_rtti, for the vtable of the base-class subobject at `offset` (see
+    /// base_class_offset).
+    pub unsafe fn find_subobject_vtable(&self, class: &str, offset: u32) -> Result<u32, String> {
+        let rdata = self.section(".rdata").ok_or_else(|| ".rdata section not found".to_string())?;
+        let rdata_bytes = unsafe { self.section_bytes(rdata) };
 
         let mut vtables = Vec::new();
-        for at in find_all(data_bytes, name.as_bytes()) {
-            // A type descriptor is a vtable pointer and a spare pointer, then the name.
-            let Some(descriptor) = (data.rva as usize + at).checked_sub(16) else { continue };
-            for col in (0..rdata_bytes.len().saturating_sub(24)).step_by(4) {
-                let col_rva = rdata.rva + col as u32;
-                if u32_at(col) != 1 || u32_at(col + 4) != 0 || u32_at(col + 12) != descriptor as u32 || u32_at(col + 20) != col_rva {
-                    continue;
-                }
-                for slot in (0..rdata_bytes.len().saturating_sub(8)).step_by(8) {
-                    let value = u64::from_le_bytes(rdata_bytes[slot..slot + 8].try_into().unwrap());
-                    if self.points_to(value, col_rva) {
-                        vtables.push(rdata.rva + slot as u32 + 8);
-                    }
+        for col_rva in unsafe { self.object_locators(class, offset)? } {
+            for slot in (0..rdata_bytes.len().saturating_sub(8)).step_by(8) {
+                let value = u64::from_le_bytes(rdata_bytes[slot..slot + 8].try_into().unwrap());
+                if self.points_to(value, col_rva) {
+                    vtables.push(rdata.rva + slot as u32 + 8);
                 }
             }
         }
         match vtables.as_slice() {
             [one] => Ok(*one),
-            [] => Err(format!("no vtable found for {class}")),
-            many => Err(format!("{} vtables found for {class}: {:x?}", many.len(), many)),
+            [] => Err(format!("no vtable found for {class} at +{offset}")),
+            many => Err(format!("{} vtables found for {class} at +{offset}: {:x?}", many.len(), many)),
         }
+    }
+
+    /// Where base class `base` sits inside `class` (the `mdisp` of its BaseClassDescriptor in
+    /// the RTTI class hierarchy of `class`).
+    pub unsafe fn base_class_offset(&self, class: &str, base: &str) -> Result<u32, String> {
+        let rd32 = |rva: u32| -> Option<u32> {
+            (rva < self.image_size.saturating_sub(4)).then(|| unsafe { *((self.base + rva as usize) as *const u32) })
+        };
+        let wanted = format!(".?AV{base}@@");
+        let col = *unsafe { self.object_locators(class, 0)? }
+            .first()
+            .ok_or_else(|| format!("no object locator for {class}"))?;
+        let hierarchy = rd32(col + 16).ok_or("bad class hierarchy pointer")?;
+        let count = rd32(hierarchy + 8).ok_or("bad base class count")?;
+        let array = rd32(hierarchy + 12).ok_or("bad base class array")?;
+        for i in 0..count.min(64) {
+            let Some(descriptor) = rd32(array + 4 * i) else { continue };
+            let Some(type_descriptor) = rd32(descriptor) else { continue };
+            if type_descriptor >= self.image_size.saturating_sub(16 + wanted.len() as u32) {
+                continue;
+            }
+            let name = unsafe { slice::from_raw_parts((self.base + type_descriptor as usize + 16) as *const u8, wanted.len() + 1) };
+            if name[..wanted.len()] == *wanted.as_bytes() && name[wanted.len()] == 0 {
+                return rd32(descriptor + 8).ok_or_else(|| "bad base class offset".to_string());
+            }
+        }
+        Err(format!("{base} is not a base class of {class}"))
+    }
+
+    /// RVA of the function in slot `index` of the vtable at `vtable` (RVA), if it is in `.text`.
+    pub unsafe fn vtable_entry(&self, vtable: u32, index: u32) -> Option<u32> {
+        let slot = vtable as usize + 8 * index as usize;
+        if slot + 8 > self.image_size as usize {
+            return None;
+        }
+        let value = unsafe { *((self.base + slot) as *const u64) };
+        let text = self.section(".text")?;
+        [self.base as u64, self.preferred_base]
+            .iter()
+            .filter_map(|b| value.checked_sub(*b))
+            .find(|rva| (text.rva as u64..text.rva as u64 + text.size as u64).contains(rva))
+            .map(|rva| rva as u32)
     }
 
     /// The one function (per `.pdata`) containing every RVA in `refs`, as (begin, end).
@@ -352,20 +416,37 @@ pub unsafe fn find_chat_recv(base: usize) -> Result<ScanHit, String> {
     }
 }
 
-/// Locates cmd_dispatch by the dword 0x41d98bec inside it (once at +0x149 in the 2026-03-10
-/// build, twice in the 2026-10-16 build; every hit is in cmd_dispatch).
+/// RPC method IDs. Every server call is a generated proxy method that passes its ID to the shared
+/// send routine (`mov r8d, id`), so the ID locates the method (see
+/// frida-scripts/chat_send_routes_oct2026.md).
+pub mod rpc {
+    /// AreaServerRequestIFaceProxy: emote / say / yell (cmd_dispatch).
+    pub const CMD_DISPATCH: u32 = 0x41d9_8bec;
+    /// ChatGatewayRequestIFaceProxy: message to a channel (guild, general, ...).
+    pub const CHANNEL_MESSAGE: u32 = 0x8919_3f50;
+    /// ChatGatewayRequestIFaceProxy: whisper.
+    pub const WHISPER: u32 = 0x5a24_9b1a;
+}
+
+/// Locates cmd_dispatch by its RPC ID (once at +0x149 in the 2026-03-10 build, twice in the
+/// 2026-10-16 build; every hit is in cmd_dispatch).
 pub unsafe fn find_cmd_dispatch(base: usize) -> Result<ScanHit, String> {
-    const LANDMARK: [u8; 4] = 0x41d9_8becu32.to_le_bytes();
+    unsafe { find_rpc_method(base, rpc::CMD_DISPATCH) }
+}
+
+/// Locates an RPC proxy method by the ID constant it loads.
+pub unsafe fn find_rpc_method(base: usize, id: u32) -> Result<ScanHit, String> {
+    let landmark = id.to_le_bytes();
     unsafe {
         let pe = PeImage::parse(base)?;
         let text = pe
             .section(".text")
             .ok_or_else(|| ".text section not found".to_string())?;
-        let refs: Vec<u32> = find_all(pe.section_bytes(text), &LANDMARK)
+        let refs: Vec<u32> = find_all(pe.section_bytes(text), &landmark)
             .map(|i| text.rva + i as u32)
             .collect();
         if refs.is_empty() {
-            return Err("landmark dword 0x41d98bec not found in .text".to_string());
+            return Err(format!("RPC id 0x{:x} not found in .text", id));
         }
         let (begin, end) = pe.unique_function(&refs)?;
         Ok(ScanHit {
@@ -383,7 +464,8 @@ pub unsafe fn find_cmd_dispatch(base: usize) -> Result<ScanHit, String> {
 
 /// RVAs of the vtables along cmd_dispatch's global pointer chain: the global holds the
 /// `OmegaClientApp`, +0x30 its `OmegaAreaObject`, +0x48 that one's
-/// `AreaServerRequestIFaceProxy` (the manager cmd_dispatch is called on).
+/// `AreaServerRequestIFaceProxy` (the manager cmd_dispatch is called on). The chat gateway hangs
+/// off the same app (see chat_gateway.rs).
 #[derive(Clone, Copy, Debug)]
 pub struct ChainVtables {
     pub app: u32,
@@ -403,6 +485,24 @@ pub unsafe fn find_chain_vtables(base: usize) -> Result<ChainVtables, String> {
     }
 }
 
+/// Locates the chat gateway's channel-message handler: entry 0 of the vtable ChatGatewayObject has
+/// for its ChatGatewayResponseIFace base (server -> client chat events). Called as
+/// `(this, ?, from_sso, channel_id_sso, i32 channel, text_sso)`.
+pub unsafe fn find_chat_channel_recv(base: usize) -> Result<ScanHit, String> {
+    unsafe {
+        let pe = PeImage::parse(base)?;
+        let offset = pe.base_class_offset("ChatGatewayObject", "ChatGatewayResponseIFace")?;
+        let vtable = pe.find_subobject_vtable("ChatGatewayObject", offset)?;
+        let entry = pe
+            .vtable_entry(vtable, 0)
+            .ok_or_else(|| format!("vtable 0x{:x} entry 0 is not in .text", vtable))?;
+        Ok(ScanHit {
+            rva: entry,
+            detail: format!("ChatGatewayResponseIFace at +{}, vtable 0x{:x}, entry 0", offset, vtable),
+        })
+    }
+}
+
 /// Offsets of every occurrence of `needle` in `hay`.
 fn find_all<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     hay.windows(needle.len()).enumerate().filter(move |(_, w)| *w == needle).map(|(i, _)| i)
@@ -415,10 +515,9 @@ mod tests {
     /// Lays out swtor.exe from disk the way the Windows loader would (headers
     /// plus each section at its RVA) and runs the scanner on it.
     ///
-    /// Run with `SWTOR_EXE=<path>` and optionally `EXPECTED_CHAT_RECV=0x...`.
     /// Run with `SWTOR_EXE=<path>` and optionally `EXPECTED_CHAT_RECV=0x...`,
     /// `EXPECTED_CMD_DISPATCH=0x...`, `EXPECTED_CHAIN_VTABLES=0x...,0x...,0x...` (app, context,
-    /// manager).
+    /// manager), `EXPECTED_CHAT_CHANNEL_RECV=0x...`.
     #[test]
     fn finds_chat_recv_in_on_disk_image() {
         let Ok(path) = std::env::var("SWTOR_EXE") else {
@@ -472,6 +571,15 @@ mod tests {
         if let Ok(expected) = std::env::var("EXPECTED_CHAIN_VTABLES") {
             let expected: Vec<u32> = expected.split(',').map(hex).collect();
             assert_eq!(vec![vtables.app, vtables.context, vtables.manager], expected);
+        }
+        for (name, id) in [("channel message", rpc::CHANNEL_MESSAGE), ("whisper", rpc::WHISPER)] {
+            let hit = unsafe { find_rpc_method(image as usize, id) }.expect("RPC method scan should succeed");
+            println!("{name}: rva=0x{:x} ({})", hit.rva, hit.detail);
+        }
+        let hit = unsafe { find_chat_channel_recv(image as usize) }.expect("channel receive scan should succeed");
+        println!("chat_channel_recv: rva=0x{:x} ({})", hit.rva, hit.detail);
+        if let Ok(expected) = std::env::var("EXPECTED_CHAT_CHANNEL_RECV") {
+            assert_eq!(hit.rva, hex(&expected));
         }
         unsafe { std::alloc::dealloc(image, layout) };
     }

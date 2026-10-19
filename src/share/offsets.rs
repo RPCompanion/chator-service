@@ -21,6 +21,9 @@ pub mod names {
     pub const CONTEXT_VTABLE: &str = "context_vtable";
     pub const MANAGER_VTABLE: &str = "manager_vtable";
     pub const FRIENDS_LIST: &str = "friends_list";
+    pub const CHAT_CHANNEL_RECV: &str = "chat_channel_recv";
+    pub const CHAT_CHANNEL_MESSAGE: &str = "chat_channel_message";
+    pub const CHAT_WHISPER: &str = "chat_whisper";
 }
 
 /// Offsets for one specific build of swtor.exe.

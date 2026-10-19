@@ -3,10 +3,12 @@ use std::sync::Mutex;
 
 use crate::share::{AsJson, CaptureMessage};
 
+pub mod chat_gateway;
 pub mod chat_message;
 pub mod cmd_dispatch;
 pub mod dice_roll;
 pub mod friends_list;
+pub mod memory;
 pub mod sigscan;
 
 static MESSAGES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));

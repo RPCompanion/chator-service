@@ -9,6 +9,8 @@ use tracing::{error, info};
 use crate::share::module_ports::ModulePorts;
 
 struct RemoteFunctions {
+    /// Missing in DLLs built before build ids existed.
+    build_id: Option<RemoteRawProcedure<extern "system" fn() -> u64>>,
     capture_module_initalized: RemoteRawProcedure<extern "system" fn() -> bool>,
     get_module_ports: RemoteRawProcedure<extern "system" fn() -> ModulePorts>,
     set_chator_port: RemoteRawProcedure<extern "system" fn(u16)>,
@@ -21,6 +23,10 @@ impl RemoteFunctions {
         injected_payload: ProcessModule<BorrowedProcess>,
     ) -> RemoteFunctions {
         RemoteFunctions {
+            build_id: unsafe {
+                syringe.get_raw_procedure::<extern "system" fn() -> u64>(injected_payload, "build_id")
+            }
+            .unwrap(),
             capture_module_initalized: unsafe {
                 syringe.get_raw_procedure::<extern "system" fn() -> bool>(
                     injected_payload,
@@ -101,6 +107,11 @@ impl<'a> SyringeContainer<'a> {
 
     pub fn eject(&self) -> Result<(), EjectError> {
         self.syringe.eject(self.injected_payload)
+    }
+
+    /// The loaded DLL's build id; None for DLLs from before build ids.
+    pub fn build_id(&self) -> Option<u64> {
+        self.remote_functions.build_id.as_ref().and_then(|f| f.call().ok())
     }
 
     /// Gets the ports that the module is listening on.

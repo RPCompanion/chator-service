@@ -40,5 +40,10 @@ ls -l "$OUT/chator-service.exe" "$OUT/swtor_chat_capture.dll"
 APP_DIR="${CHATOR_APP_DIR:-$(cd .. && pwd)/ChaTOR}"
 APP_SERVICE_DIR="$APP_DIR/src-tauri/service"
 mkdir -p "$APP_SERVICE_DIR"
-cp -f "$OUT/chator-service.exe" "$OUT/swtor_chat_capture.dll" "$APP_SERVICE_DIR/"
+# Copy to a temporary name and rename over the old file: a running SWTOR may still have the old
+# DLL mapped, and overwriting that file in place would change the game's mapped pages.
+for f in chator-service.exe swtor_chat_capture.dll; do
+  cp -f "$OUT/$f" "$APP_SERVICE_DIR/.$f.new"
+  mv -f "$APP_SERVICE_DIR/.$f.new" "$APP_SERVICE_DIR/$f"
+done
 echo "Copied into $APP_SERVICE_DIR"

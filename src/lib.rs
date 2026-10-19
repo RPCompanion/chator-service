@@ -16,6 +16,7 @@ use std::str;
 use std::thread;
 use std::time::Duration;
 
+use lib_only::chat_gateway;
 use lib_only::chat_message;
 use lib_only::cmd_dispatch;
 use lib_only::dice_roll;
@@ -39,6 +40,12 @@ static CHATOR_PORT: AtomicU16 = AtomicU16::new(0);
 static LOCAL_PORT: AtomicU16 = AtomicU16::new(0);
 // Result of the last (and only) hook installation; hooks are installed once per injection.
 static HOOK_REPORT: Mutex<Option<HookReport>> = Mutex::new(None);
+
+/// The build id of this DLL; the service replaces a loaded DLL whose id is not its own.
+#[unsafe(no_mangle)]
+extern "system" fn build_id() -> u64 {
+    share::BUILD_ID
+}
 
 #[unsafe(no_mangle)]
 extern "system" fn capture_module_initalized() -> bool {
@@ -302,7 +309,7 @@ fn install_hooks(
                     "Failed to find swtor.exe module: {:?}",
                     e
                 )));
-                for name in [names::CHAT_RECV, names::ROLL_HANDLER, names::CMD_DISPATCH] {
+                for name in [names::CHAT_RECV, names::ROLL_HANDLER, names::CMD_DISPATCH, names::CHAT_CHANNEL_RECV] {
                     report.hooks.push(HookStatus {
                         name: name.to_string(),
                         rva: None,
@@ -416,6 +423,49 @@ fn install_hooks(
         });
     }
 
+    // ---- chat gateway: the channel / whisper RPCs, and the channel-message handler whose hook
+    // learns the channel ids; dynamic lookup first, table as fallback ----
+    {
+        let base = base_address as usize;
+        let mut detail: Vec<String> = Vec::new();
+        let mut method = |name: &str, label: &str, id: u32| {
+            let (rva, _, notes) = resolve_rva(offsets, name, dynamic_lookup, || unsafe { sigscan::find_rpc_method(base, id) });
+            detail.extend(notes.into_iter().map(|n| format!("{label} {n}")));
+            rva
+        };
+        let channel_rva = method(names::CHAT_CHANNEL_MESSAGE, "channel message", sigscan::rpc::CHANNEL_MESSAGE);
+        let whisper_rva = method(names::CHAT_WHISPER, "whisper", sigscan::rpc::WHISPER);
+        match (channel_rva, whisper_rva) {
+            (Some(c), Some(w)) => chat_gateway::set_methods(
+                base,
+                chat_gateway::Methods { channel_message: base + c as usize, whisper: base + w as usize },
+            ),
+            _ => detail.push("send methods not found; channels and whispers will be typed".to_string()),
+        }
+
+        let (rva, source, notes) = resolve_rva(offsets, names::CHAT_CHANNEL_RECV, dynamic_lookup, || unsafe {
+            sigscan::find_chat_channel_recv(base)
+        });
+        detail.extend(notes);
+        let installed = match rva {
+            Some(r) => match chat_gateway::begin_detour(base + r as usize) {
+                Ok(()) => true,
+                Err(e) => {
+                    detail.push(e);
+                    false
+                }
+            },
+            None => false,
+        };
+        report.hooks.push(HookStatus {
+            name: names::CHAT_CHANNEL_RECV.to_string(),
+            rva,
+            source,
+            installed,
+            detail: Some(detail.join("; ")),
+        });
+    }
+
     submit_message(CaptureMessage::Info(format!(
         "Hook installation finished: {}",
         report.summary()
@@ -428,6 +478,7 @@ fn end_detours() {
     chat_message::end_detour();
     dice_roll::end_detour();
     cmd_dispatch::end_detour();
+    chat_gateway::end_detour();
     // Hooks are gone, so a later InstallHooks must really reinstall.
     *HOOK_REPORT.lock().unwrap() = None;
 }

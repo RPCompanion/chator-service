@@ -137,6 +137,11 @@ pub fn shutdown(reason: &str) {
     });
 }
 
+/// Whether `shutdown` has started; nothing may be injected after that.
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Blocking read loop — reads FromClient messages and dispatches them.
 pub fn recv_loop(stream: TcpStream) {
     let reader = BufReader::new(stream);
@@ -238,42 +243,14 @@ fn has_link_markup(msg: &str) -> bool {
     msg.contains("<HL ")
 }
 
-/// Commands that cmd_dispatch handles when called directly.
-const DIRECT_COMMANDS: &[&str] = &["e", "em", "emote", "s", "say", "y", "yell"];
-
-/// Sends every message through cmd_dispatch, in order. All of them must start with /e, /s or /y:
-/// without a command the game would post into whatever channel is active, which we cannot know.
-fn send_directly(messages: &[String]) -> Result<(), String> {
-    let mut commands = Vec::with_capacity(messages.len());
-    for message in messages {
-        match parse_slash_command(message) {
-            Some((cmd, text)) if DIRECT_COMMANDS.contains(&cmd.to_ascii_lowercase().as_str()) => commands.push((cmd, text)),
-            _ => {
-                return Err("Messages with item links can only be posted with /e, /s or /y for now: start the message with one of them.".to_string());
-            }
-        }
-    }
-    for (i, (cmd, text)) in commands.iter().enumerate() {
-        if i > 0 {
-            // Space the parts out like a person would; the game rate-limits chat.
-            std::thread::sleep(std::time::Duration::from_millis(750));
-        }
-        crate::capture_injector::send_chat_command(cmd, text).map_err(|e| format!("Could not post with an item link: {e}"))?;
-        info!("Posted directly: /{} ({} chars)", cmd, text.len());
-    }
+/// Hands one `/command text` message to the DLL, which calls the game's own send function for it
+/// (cmd_dispatch for /e /s /y, the chat gateway for channels and whispers). Errors without
+/// sending when it cannot (no command, custom channel, channel not seen yet, DLL not injected).
+fn send_directly(message: &str) -> Result<(), String> {
+    let (cmd, text) = parse_slash_command(message).ok_or("no slash command")?;
+    crate::capture_injector::send_chat_command(&cmd, &text)?;
+    info!("Posted directly: /{} ({} chars)", cmd, text.len());
     Ok(())
-}
-
-fn is_roll_command(msg: &str) -> bool {
-    let trimmed = msg.trim().to_ascii_lowercase();
-    trimmed == "/roll" || trimmed.starts_with("/roll ")
-}
-
-fn is_whisper_command(msg: &str) -> bool {
-    let trimmed = msg.trim().to_ascii_lowercase();
-    trimmed.starts_with("/w ")
-        || trimmed.starts_with("/whisper ")
-        || trimmed.starts_with("/tell ")
 }
 
 fn parse_slash_command(msg: &str) -> Option<(String, String)> {
@@ -296,57 +273,27 @@ fn route_submit_post(
     mut character_message: UserCharacterMessages,
 ) -> Result<(), String> {
     character_message.prepare_messages();
+    let UserCharacterMessages { message_type, character_id, messages } = character_message;
 
-    // Item links (`<HL LID="...">` markup) only survive when the message is handed to the game's
-    // send function (cmd_dispatch) directly: typed into the chat box, the game escapes '<' and
-    // the link arrives as text. That path works for /e, /s and /y.
-    if character_message.messages.iter().any(|m| has_link_markup(m)) {
-        return send_directly(&character_message.messages);
+    // Each message goes to the game's send function directly when the DLL can do that, else it is
+    // typed into the chat box; in order, one at a time.
+    for (i, message) in messages.into_iter().enumerate() {
+        if i > 0 {
+            // Space the parts out like a person would; the game rate-limits chat.
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
+        let error = match send_directly(&message) {
+            Ok(()) => continue,
+            Err(e) => e,
+        };
+        // Item links (`<HL LID="...">`) cannot be typed: the game escapes '<' and posts the
+        // markup as text.
+        if has_link_markup(&message) {
+            return Err(format!("Could not post with an item link: {error}"));
+        }
+        info!("Typing instead of sending directly ({error})");
+        let single = UserCharacterMessages { message_type, character_id, messages: vec![message] };
+        crate::swtor_hook::post::submit_post(retry, single).map_err(|e| e.to_string())?;
     }
-
-    // All other messages go through keystroke injection for now.
-    // cmd_dispatch only works reliably for emote/say/yell — guild, whisper,
-    // group, ops, and roll all bypass cmd_dispatch's entry point and use
-    // a different code path (roll_wrapper → cmd_dispatch+0x210).
-    crate::swtor_hook::post::submit_post(retry, character_message)
-        .map_err(|e| e.to_string())
-
-    // TODO: Re-enable cmd_dispatch routing once we understand which commands
-    // go through cmd_dispatch vs roll_wrapper+0x210.
-    //
-    // let message_type = character_message.message_type;
-    // let character_id = character_message.character_id;
-    // let mut keystroke_messages = Vec::new();
-    //
-    // for message in &character_message.messages {
-    //     if is_roll_command(message) || is_whisper_command(message) || !message.starts_with('/') {
-    //         keystroke_messages.push(message.clone());
-    //     } else if let Some((cmd, text)) = parse_slash_command(message) {
-    //         match crate::capture_injector::send_chat_command(&cmd, &text) {
-    //             Ok(()) => {
-    //                 info!("Direct dispatch succeeded: /{} {}", cmd, text);
-    //             }
-    //             Err(e) => {
-    //                 info!(
-    //                     "Direct dispatch failed ({}), falling back to keystroke injection",
-    //                     e
-    //                 );
-    //                 keystroke_messages.push(message.clone());
-    //             }
-    //         }
-    //     } else {
-    //         keystroke_messages.push(message.clone());
-    //     }
-    // }
-    //
-    // if !keystroke_messages.is_empty() {
-    //     let ks_cm = UserCharacterMessages {
-    //         message_type,
-    //         character_id,
-    //         messages: keystroke_messages,
-    //     };
-    //     crate::swtor_hook::post::submit_post(retry, ks_cm).map_err(|e| e.to_string())?;
-    // }
-    //
-    // Ok(())
+    Ok(())
 }
