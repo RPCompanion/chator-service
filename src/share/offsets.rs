@@ -188,7 +188,8 @@ mod tests {
         assert_eq!(oct.offsets[names::CHAT_RECV], 0x5220b0);
         assert_eq!(oct.offsets[names::CMD_DISPATCH], 0x3e25b0);
         assert_eq!(oct.offsets[names::ROLL_HANDLER], 0xe56780);
-        assert!(!oct.offsets.contains_key(names::GLOBAL_PTR));
+        assert_eq!(oct.offsets[names::GLOBAL_PTR], 0x1bac4a8);
+        assert_eq!(oct.offsets[names::MANAGER_VTABLE], 0x1483e98);
     }
 
     #[test]

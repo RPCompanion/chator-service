@@ -234,6 +234,36 @@ fn handle_message(msg: FromClient) {
     }
 }
 
+fn has_link_markup(msg: &str) -> bool {
+    msg.contains("<HL ")
+}
+
+/// Commands that cmd_dispatch handles when called directly.
+const DIRECT_COMMANDS: &[&str] = &["e", "em", "emote", "s", "say", "y", "yell"];
+
+/// Sends every message through cmd_dispatch, in order. All of them must start with /e, /s or /y:
+/// without a command the game would post into whatever channel is active, which we cannot know.
+fn send_directly(messages: &[String]) -> Result<(), String> {
+    let mut commands = Vec::with_capacity(messages.len());
+    for message in messages {
+        match parse_slash_command(message) {
+            Some((cmd, text)) if DIRECT_COMMANDS.contains(&cmd.to_ascii_lowercase().as_str()) => commands.push((cmd, text)),
+            _ => {
+                return Err("Messages with item links can only be posted with /e, /s or /y for now: start the message with one of them.".to_string());
+            }
+        }
+    }
+    for (i, (cmd, text)) in commands.iter().enumerate() {
+        if i > 0 {
+            // Space the parts out like a person would; the game rate-limits chat.
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
+        crate::capture_injector::send_chat_command(cmd, text).map_err(|e| format!("Could not post with an item link: {e}"))?;
+        info!("Posted directly: /{} ({} chars)", cmd, text.len());
+    }
+    Ok(())
+}
+
 fn is_roll_command(msg: &str) -> bool {
     let trimmed = msg.trim().to_ascii_lowercase();
     trimmed == "/roll" || trimmed.starts_with("/roll ")
@@ -267,7 +297,14 @@ fn route_submit_post(
 ) -> Result<(), String> {
     character_message.prepare_messages();
 
-    // All messages go through keystroke injection for now.
+    // Item links (`<HL LID="...">` markup) only survive when the message is handed to the game's
+    // send function (cmd_dispatch) directly: typed into the chat box, the game escapes '<' and
+    // the link arrives as text. That path works for /e, /s and /y.
+    if character_message.messages.iter().any(|m| has_link_markup(m)) {
+        return send_directly(&character_message.messages);
+    }
+
+    // All other messages go through keystroke injection for now.
     // cmd_dispatch only works reliably for emote/say/yell — guild, whisper,
     // group, ops, and roll all bypass cmd_dispatch's entry point and use
     // a different code path (roll_wrapper → cmd_dispatch+0x210).

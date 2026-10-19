@@ -10,6 +10,9 @@
 //!      There is exactly one in every build seen so far.
 //!   3. Look the reference up in the PE exception directory (`.pdata`) to get
 //!      the start of the enclosing function, following chained unwind info.
+//!
+//! `cmd_dispatch` is found by a constant inside it, and the vtables of its global pointer chain
+//! by their MSVC RTTI class names (see `find_chain_vtables`).
 
 use std::slice;
 
@@ -27,6 +30,9 @@ pub struct Section {
 
 pub struct PeImage {
     base: usize,
+    /// ImageBase from the optional header: what absolute addresses in an unrelocated image
+    /// (laid out from disk, in tests) are relative to.
+    preferred_base: u64,
     image_size: u32,
     sections: Vec<Section>,
     pdata_rva: u32,
@@ -60,6 +66,7 @@ impl PeImage {
             if rd16(opt) != 0x20b {
                 return Err("not a PE32+ image".into());
             }
+            let preferred_base = *((base + opt + 24) as *const u64);
             let image_size = rd32(opt + 56);
             let num_dirs = rd32(opt + 108) as usize;
             if num_dirs <= IMAGE_DIRECTORY_ENTRY_EXCEPTION {
@@ -89,6 +96,7 @@ impl PeImage {
 
             Ok(PeImage {
                 base,
+                preferred_base,
                 image_size,
                 sections,
                 pdata_rva,
@@ -101,8 +109,12 @@ impl PeImage {
         self.sections.iter().find(|s| s.name == name)
     }
 
+    pub fn image_size(&self) -> u32 {
+        self.image_size
+    }
+
     /// Returns the mapped bytes of a section (clamped to the image size).
-    unsafe fn section_bytes(&self, sec: &Section) -> &[u8] {
+    pub unsafe fn section_bytes(&self, sec: &Section) -> &[u8] {
         let end = (sec.rva as u64 + sec.size as u64).min(self.image_size as u64) as u32;
         let len = end.saturating_sub(sec.rva) as usize;
         unsafe { slice::from_raw_parts((self.base + sec.rva as usize) as *const u8, len) }
@@ -166,6 +178,75 @@ impl PeImage {
             }
         }
         hits
+    }
+
+    /// Whether `value`, read from the image, is the address of `rva` (relocated, or relative to
+    /// the preferred base when the image was laid out from disk).
+    fn points_to(&self, value: u64, rva: u32) -> bool {
+        value == self.base as u64 + rva as u64 || value == self.preferred_base + rva as u64
+    }
+
+    /// Finds a class's primary vtable through MSVC RTTI and returns its RVA: the type
+    /// descriptor holding the decorated name (`.?AV<class>@@`, in `.data`), the
+    /// CompleteObjectLocator in `.rdata` that refers to it (signature 1, offset 0, its own RVA
+    /// last), then the `.rdata` slot pointing at that locator, which sits right before the vtable.
+    pub unsafe fn find_vtable_by_rtti(&self, class: &str) -> Result<u32, String> {
+        let name = format!(".?AV{class}@@\0");
+        let data = self.section(".data").ok_or_else(|| ".data section not found".to_string())?;
+        let rdata = self.section(".rdata").ok_or_else(|| ".rdata section not found".to_string())?;
+        let (data_bytes, rdata_bytes) = unsafe { (self.section_bytes(data), self.section_bytes(rdata)) };
+        let u32_at = |i: usize| u32::from_le_bytes(rdata_bytes[i..i + 4].try_into().unwrap());
+
+        let mut vtables = Vec::new();
+        for at in find_all(data_bytes, name.as_bytes()) {
+            // A type descriptor is a vtable pointer and a spare pointer, then the name.
+            let Some(descriptor) = (data.rva as usize + at).checked_sub(16) else { continue };
+            for col in (0..rdata_bytes.len().saturating_sub(24)).step_by(4) {
+                let col_rva = rdata.rva + col as u32;
+                if u32_at(col) != 1 || u32_at(col + 4) != 0 || u32_at(col + 12) != descriptor as u32 || u32_at(col + 20) != col_rva {
+                    continue;
+                }
+                for slot in (0..rdata_bytes.len().saturating_sub(8)).step_by(8) {
+                    let value = u64::from_le_bytes(rdata_bytes[slot..slot + 8].try_into().unwrap());
+                    if self.points_to(value, col_rva) {
+                        vtables.push(rdata.rva + slot as u32 + 8);
+                    }
+                }
+            }
+        }
+        match vtables.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(format!("no vtable found for {class}")),
+            many => Err(format!("{} vtables found for {class}: {:x?}", many.len(), many)),
+        }
+    }
+
+    /// The one function (per `.pdata`) containing every RVA in `refs`, as (begin, end).
+    pub unsafe fn unique_function(&self, refs: &[u32]) -> Result<(u32, u32), String> {
+        let mut starts: Vec<(u32, u32)> = Vec::new();
+        for r in refs {
+            match unsafe { self.function_bounds(*r) } {
+                Some(b) => {
+                    if !starts.contains(&b) {
+                        starts.push(b);
+                    }
+                }
+                None => {
+                    return Err(format!("reference at 0x{:x} has no .pdata entry", r));
+                }
+            }
+        }
+        if starts.len() != 1 {
+            return Err(format!(
+                "landmark references resolve to {} different functions: {:?}",
+                starts.len(),
+                starts
+                    .iter()
+                    .map(|(b, e)| format!("0x{:x}..0x{:x}", b, e))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        Ok(starts[0])
     }
 
     unsafe fn runtime_functions(&self) -> &[[u32; 3]] {
@@ -256,31 +337,7 @@ pub unsafe fn find_chat_recv(base: usize) -> Result<ScanHit, String> {
             ));
         }
 
-        let mut starts: Vec<(u32, u32)> = Vec::new();
-        for r in &refs {
-            match pe.function_bounds(*r) {
-                Some(b) => {
-                    if !starts.contains(&b) {
-                        starts.push(b);
-                    }
-                }
-                None => {
-                    return Err(format!("reference at 0x{:x} has no .pdata entry", r));
-                }
-            }
-        }
-        if starts.len() != 1 {
-            return Err(format!(
-                "landmark references resolve to {} different functions: {:?}",
-                starts.len(),
-                starts
-                    .iter()
-                    .map(|(b, e)| format!("0x{:x}..0x{:x}", b, e))
-                    .collect::<Vec<_>>()
-            ));
-        }
-
-        let (begin, end) = starts[0];
+        let (begin, end) = pe.unique_function(&refs)?;
         Ok(ScanHit {
             rva: begin,
             detail: format!(
@@ -295,6 +352,62 @@ pub unsafe fn find_chat_recv(base: usize) -> Result<ScanHit, String> {
     }
 }
 
+/// Locates cmd_dispatch by the dword 0x41d98bec inside it (once at +0x149 in the 2026-03-10
+/// build, twice in the 2026-10-16 build; every hit is in cmd_dispatch).
+pub unsafe fn find_cmd_dispatch(base: usize) -> Result<ScanHit, String> {
+    const LANDMARK: [u8; 4] = 0x41d9_8becu32.to_le_bytes();
+    unsafe {
+        let pe = PeImage::parse(base)?;
+        let text = pe
+            .section(".text")
+            .ok_or_else(|| ".text section not found".to_string())?;
+        let refs: Vec<u32> = find_all(pe.section_bytes(text), &LANDMARK)
+            .map(|i| text.rva + i as u32)
+            .collect();
+        if refs.is_empty() {
+            return Err("landmark dword 0x41d98bec not found in .text".to_string());
+        }
+        let (begin, end) = pe.unique_function(&refs)?;
+        Ok(ScanHit {
+            rva: begin,
+            detail: format!(
+                "{} landmark hit(s) (first 0x{:x}), function 0x{:x}..0x{:x}",
+                refs.len(),
+                refs[0],
+                begin,
+                end
+            ),
+        })
+    }
+}
+
+/// RVAs of the vtables along cmd_dispatch's global pointer chain: the global holds the
+/// `OmegaClientApp`, +0x30 its `OmegaAreaObject`, +0x48 that one's
+/// `AreaServerRequestIFaceProxy` (the manager cmd_dispatch is called on).
+#[derive(Clone, Copy, Debug)]
+pub struct ChainVtables {
+    pub app: u32,
+    pub context: u32,
+    pub manager: u32,
+}
+
+/// Finds the chain's vtables by their RTTI class names.
+pub unsafe fn find_chain_vtables(base: usize) -> Result<ChainVtables, String> {
+    unsafe {
+        let pe = PeImage::parse(base)?;
+        Ok(ChainVtables {
+            app: pe.find_vtable_by_rtti("OmegaClientApp")?,
+            context: pe.find_vtable_by_rtti("OmegaAreaObject")?,
+            manager: pe.find_vtable_by_rtti("AreaServerRequestIFaceProxy")?,
+        })
+    }
+}
+
+/// Offsets of every occurrence of `needle` in `hay`.
+fn find_all<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    hay.windows(needle.len()).enumerate().filter(move |(_, w)| *w == needle).map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +416,9 @@ mod tests {
     /// plus each section at its RVA) and runs the scanner on it.
     ///
     /// Run with `SWTOR_EXE=<path>` and optionally `EXPECTED_CHAT_RECV=0x...`.
+    /// Run with `SWTOR_EXE=<path>` and optionally `EXPECTED_CHAT_RECV=0x...`,
+    /// `EXPECTED_CMD_DISPATCH=0x...`, `EXPECTED_CHAIN_VTABLES=0x...,0x...,0x...` (app, context,
+    /// manager).
     #[test]
     fn finds_chat_recv_in_on_disk_image() {
         let Ok(path) = std::env::var("SWTOR_EXE") else {
@@ -338,9 +454,24 @@ mod tests {
         let hit = unsafe { find_chat_recv(image as usize) }.expect("scan should succeed");
         println!("chat_recv scan: rva=0x{:x} ({})", hit.rva, hit.detail);
 
+        let hex = |v: &str| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).unwrap();
         if let Ok(expected) = std::env::var("EXPECTED_CHAT_RECV") {
-            let expected = u64::from_str_radix(expected.trim_start_matches("0x"), 16).unwrap();
-            assert_eq!(hit.rva as u64, expected);
+            assert_eq!(hit.rva, hex(&expected));
+        }
+
+        let started = std::time::Instant::now();
+        let hit = unsafe { find_cmd_dispatch(image as usize) }.expect("cmd_dispatch scan should succeed");
+        println!("cmd_dispatch scan: rva=0x{:x} ({}) in {:?}", hit.rva, hit.detail, started.elapsed());
+        if let Ok(expected) = std::env::var("EXPECTED_CMD_DISPATCH") {
+            assert_eq!(hit.rva, hex(&expected));
+        }
+
+        let started = std::time::Instant::now();
+        let vtables = unsafe { find_chain_vtables(image as usize) }.expect("RTTI scan should succeed");
+        println!("chain vtables: {:x?} in {:?}", vtables, started.elapsed());
+        if let Ok(expected) = std::env::var("EXPECTED_CHAIN_VTABLES") {
+            let expected: Vec<u32> = expected.split(',').map(hex).collect();
+            assert_eq!(vec![vtables.app, vtables.context, vtables.manager], expected);
         }
         unsafe { std::alloc::dealloc(image, layout) };
     }

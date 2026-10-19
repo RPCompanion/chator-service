@@ -1,3 +1,6 @@
+// Keep the console for development; packaged Windows builds run in the background.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;

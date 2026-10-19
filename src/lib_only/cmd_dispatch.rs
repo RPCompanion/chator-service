@@ -3,16 +3,17 @@ use std::mem;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::lib_only::sigscan::{self, ChainVtables};
 use crate::lib_only::submit_message;
 use crate::share::CaptureMessage;
 use crate::share::dll_command::DiagnosticsInfo;
 
 /// Global pointer chain to find cmd_dispatch args without hooking:
-///   [base + global_ptr] -> obj
-///     obj + 0x30 = cmdContext  (vtable at base + context_vtable)
-///       cmdContext + 0x48 = cmdManager (vtable at base + manager_vtable)
+///   [base + global_ptr] -> obj (OmegaClientApp)
+///     obj + 0x30 = cmdContext  (OmegaAreaObject, vtable at base + context_vtable)
+///       cmdContext + 0x48 = cmdManager (AreaServerRequestIFaceProxy, vtable at base + manager_vtable)
 ///
-/// All three are RVAs supplied by the offset table for the running build.
+/// All three are RVAs, from the offset table or found at runtime (`ChainSource::Rtti`).
 #[derive(Clone, Copy, Debug)]
 pub struct GlobalChain {
     pub global_ptr: usize,
@@ -26,8 +27,23 @@ static_detour! {
 }
 
 static CAPTURED_MANAGER: Mutex<Option<usize>> = Mutex::new(None);
+/// The captured manager's vtable pointer, checked before every send: without a global chain the
+/// manager is only known from an earlier game call and may have been freed since (character
+/// switch, logout), and calling cmd_dispatch on it would crash the game.
+static CAPTURED_VTABLE: Mutex<Option<usize>> = Mutex::new(None);
 static BASE_ADDRESS: Mutex<Option<isize>> = Mutex::new(None);
 static GLOBAL_CHAIN: Mutex<Option<GlobalChain>> = Mutex::new(None);
+/// Vtables found by RTTI while the global is not found yet: the game creates its
+/// OmegaClientApp during startup, possibly after we were injected.
+static CHAIN_VTABLES: Mutex<Option<ChainVtables>> = Mutex::new(None);
+
+/// Where the global pointer chain comes from.
+pub enum ChainSource {
+    Table(GlobalChain),
+    /// Vtables found by RTTI; the global is searched for in `.data`.
+    Rtti(ChainVtables),
+    None,
+}
 static DETOUR_ENABLED: AtomicBool = AtomicBool::new(false);
 static LAST_GAME_CMD: Mutex<Option<String>> = Mutex::new(None);
 static GAME_CALL_COUNT: Mutex<u64> = Mutex::new(0);
@@ -136,6 +152,127 @@ unsafe fn read_sso_string(ptr: *const u8) -> Option<String> {
     }
 }
 
+/// Remembers a manager the game just used (or the global chain just validated), with its vtable.
+fn capture_manager(manager: usize) {
+    let vtable = unsafe { *(manager as *const usize) };
+    *CAPTURED_MANAGER.lock().unwrap() = Some(manager);
+    *CAPTURED_VTABLE.lock().unwrap() = Some(vtable);
+}
+
+/// Readability of addresses, remembering the last region VirtualQuery described so that a scan
+/// over many pointers into the same heap region queries it once.
+#[derive(Default)]
+struct Regions {
+    start: usize,
+    end: usize,
+    readable: bool,
+}
+
+impl Regions {
+    /// Whether the 8 bytes at `address` are committed, readable memory.
+    fn readable(&mut self, address: usize) -> bool {
+        use windows::Win32::System::Memory::*;
+        if !(self.start..self.end).contains(&address) {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            let size = unsafe {
+                VirtualQuery(Some(address as *const _), &mut info, mem::size_of::<MEMORY_BASIC_INFORMATION>())
+            };
+            if size == 0 {
+                return false;
+            }
+            let readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            *self = Regions {
+                start: info.BaseAddress as usize,
+                end: info.BaseAddress as usize + info.RegionSize,
+                readable: info.State == MEM_COMMIT
+                    && (info.Protect & readable).0 != 0
+                    && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)).0 == 0,
+            };
+        }
+        self.readable && address + 8 <= self.end
+    }
+}
+
+unsafe fn is_readable(address: usize) -> bool {
+    Regions::default().readable(address)
+}
+
+/// Finds the `.data` global holding the OmegaClientApp object, the start of the chain: the first
+/// 8-byte slot pointing at an object with that vtable. Returns its RVA and how many slots
+/// matched; None until the game has created the object.
+fn find_global(base: usize, app_vtable_rva: u32) -> Option<(usize, usize)> {
+    let pe = unsafe { sigscan::PeImage::parse(base) }.ok()?;
+    let data = pe.section(".data")?;
+    let bytes = unsafe { pe.section_bytes(data) };
+    let image = base..base + pe.image_size() as usize;
+    let app_vtable = base + app_vtable_rva as usize;
+
+    let mut regions = Regions::default();
+    let mut first = None;
+    let mut count = 0;
+    for (i, slot) in bytes.chunks_exact(8).enumerate() {
+        let value = usize::from_le_bytes(slot.try_into().unwrap());
+        if value < 0x10000 || value % 8 != 0 || value > 0x7fff_ffff_ffff || image.contains(&value) {
+            continue;
+        }
+        if regions.readable(value) && unsafe { *(value as *const usize) } == app_vtable {
+            count += 1;
+            first.get_or_insert(data.rva as usize + i * 8);
+        }
+    }
+    first.map(|global| (global, count))
+}
+
+/// With vtables from RTTI but no global yet, looks for the global (again).
+fn resolve_global_chain(base_address: isize) {
+    if GLOBAL_CHAIN.lock().unwrap().is_some() {
+        return;
+    }
+    let Some(vtables) = *CHAIN_VTABLES.lock().unwrap() else {
+        return;
+    };
+    if let Some((global_ptr, count)) = find_global(base_address as usize, vtables.app) {
+        *GLOBAL_CHAIN.lock().unwrap() = Some(GlobalChain {
+            global_ptr,
+            context_vtable: vtables.context as usize,
+            manager_vtable: vtables.manager as usize,
+        });
+        submit_message(CaptureMessage::Info(format!(
+            "cmd_dispatch global chain found: global 0x{:x} ({} slot(s) point at the OmegaClientApp)",
+            global_ptr, count
+        )));
+    }
+}
+
+/// One line about the global chain for the hook report.
+pub fn chain_status() -> String {
+    match (*GLOBAL_CHAIN.lock().unwrap(), *CHAIN_VTABLES.lock().unwrap()) {
+        (Some(chain), Some(v)) => format!(
+            "global chain found at runtime: global 0x{:x}, vtables 0x{:x} / 0x{:x} / 0x{:x}",
+            chain.global_ptr, v.app, v.context, v.manager
+        ),
+        (Some(chain), None) => format!("global chain from table: global 0x{:x}", chain.global_ptr),
+        (None, Some(_)) => "global chain vtables found, global not set yet (game starting); retried when sending".to_string(),
+        (None, None) => "global chain unavailable; sends need a chat message from the game first".to_string(),
+    }
+}
+
+/// The captured manager, if it still looks like the object the game used.
+fn live_manager() -> Result<usize, String> {
+    let (Some(manager), Some(vtable)) = (*CAPTURED_MANAGER.lock().unwrap(), *CAPTURED_VTABLE.lock().unwrap()) else {
+        if GLOBAL_CHAIN.lock().unwrap().is_some() {
+            return Err("The game is not ready to chat yet. Log in to a character, then try again.".to_string());
+        }
+        return Err("ChaTOR has not seen the game send a chat message yet. Post any /e from the game's chat box once, then try again.".to_string());
+    };
+    if unsafe { is_readable(manager) && *(manager as *const usize) == vtable } {
+        Ok(manager)
+    } else {
+        *CAPTURED_MANAGER.lock().unwrap() = None;
+        Err("The game's chat state changed since ChaTOR last saw it (character switch?). Post any /e from the game's chat box once, then try again.".to_string())
+    }
+}
+
 /// Reads the manager pointer from the global pointer chain. Returns None when
 /// no chain is known for this build or any step of the chain fails validation.
 unsafe fn read_pointers_from_global(base_address: isize) -> Option<usize> {
@@ -183,16 +320,23 @@ unsafe fn read_pointers_from_global(base_address: isize) -> Option<usize> {
 pub fn begin_detour(
     base_address: isize,
     cmd_dispatch_rva: u64,
-    chain: Option<GlobalChain>,
+    chain: ChainSource,
 ) -> Result<(), String> {
     *BASE_ADDRESS.lock().unwrap() = Some(base_address);
-    *GLOBAL_CHAIN.lock().unwrap() = chain;
+    let (table, vtables) = match chain {
+        ChainSource::Table(chain) => (Some(chain), None),
+        ChainSource::Rtti(vtables) => (None, Some(vtables)),
+        ChainSource::None => (None, None),
+    };
+    *GLOBAL_CHAIN.lock().unwrap() = table;
+    *CHAIN_VTABLES.lock().unwrap() = vtables;
+    resolve_global_chain(base_address);
 
     // Try to read manager from the global chain immediately
-    if chain.is_some() {
+    if GLOBAL_CHAIN.lock().unwrap().is_some() {
         unsafe {
             if let Some(manager) = read_pointers_from_global(base_address) {
-                *CAPTURED_MANAGER.lock().unwrap() = Some(manager);
+                capture_manager(manager);
                 submit_message(CaptureMessage::Info(format!(
                     "cmd_dispatch manager from global: 0x{:x}",
                     manager
@@ -206,7 +350,7 @@ pub fn begin_detour(
         }
     } else {
         submit_message(CaptureMessage::Info(
-            "cmd_dispatch global chain unknown for this build, will capture manager from hook"
+            "cmd_dispatch global chain not available yet, will capture manager from hook or retry when sending"
                 .to_string(),
         ));
     }
@@ -236,7 +380,7 @@ fn cmd_dispatch_detour(
 ) {
     let mgr_addr = manager as usize;
     if mgr_addr != 0 {
-        *CAPTURED_MANAGER.lock().unwrap() = Some(mgr_addr);
+        capture_manager(mgr_addr);
     }
 
     // Read command name from the SSO string for logging
@@ -253,6 +397,14 @@ fn cmd_dispatch_detour(
         "cmd_dispatch GAME CALL #{}: cmd=\"{}\", mgr=0x{:x}",
         call_num, cmd_str, mgr_addr
     )));
+
+    // Log the text only when it carries markup (an item link the player shift-clicked in, or
+    // escaped '<'), to learn the exact link format the game hands to cmd_dispatch.
+    if let Some(msg) = unsafe { read_sso_string(msg_sso) } {
+        if msg.contains('<') || msg.contains("&lt;") {
+            submit_message(CaptureMessage::Info(format!("cmd_dispatch GAME CALL #{} message with markup: {}", call_num, msg)));
+        }
+    }
 
     CmdDispatchHook.call(manager, cmd_name_sso, msg_sso);
 }
@@ -301,17 +453,15 @@ pub fn send_command(command: &str, message: &str) -> Result<(), String> {
 
     // Re-read manager from global chain for freshness
     if let Some(base) = *BASE_ADDRESS.lock().unwrap() {
+        resolve_global_chain(base);
         unsafe {
             if let Some(manager) = read_pointers_from_global(base) {
-                *CAPTURED_MANAGER.lock().unwrap() = Some(manager);
+                capture_manager(manager);
             }
         }
     }
 
-    let manager = CAPTURED_MANAGER
-        .lock()
-        .unwrap()
-        .ok_or_else(|| "cmd_dispatch manager not available".to_string())?;
+    let manager = live_manager()?;
 
     let resolved = resolve_command_name(command);
 

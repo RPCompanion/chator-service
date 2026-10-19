@@ -237,6 +237,43 @@ fn start_command_listener(listener: TcpListener) {
     });
 }
 
+/// Picks a hook's RVA: the runtime scan when dynamic lookup is on and it succeeds, else the offset
+/// table. Returns the RVA, where it came from, and notes for the report.
+fn resolve_rva(
+    offsets: &BTreeMap<String, u64>,
+    name: &str,
+    dynamic_lookup: bool,
+    scan: impl FnOnce() -> Result<sigscan::ScanHit, String>,
+) -> (Option<u64>, OffsetSource, Vec<String>) {
+    let table_rva = offsets.get(name).copied();
+    let mut detail: Vec<String> = Vec::new();
+
+    if dynamic_lookup {
+        match scan() {
+            Ok(hit) => {
+                detail.push(format!("scan: {}", hit.detail));
+                if let Some(t) = table_rva {
+                    if t != hit.rva as u64 {
+                        detail.push(format!(
+                            "table offset 0x{:x} differs from scan result 0x{:x}; using scan",
+                            t, hit.rva
+                        ));
+                    }
+                }
+                return (Some(hit.rva as u64), OffsetSource::Dynamic, detail);
+            }
+            Err(e) => detail.push(format!("scan failed: {}", e)),
+        }
+    }
+    match table_rva {
+        Some(t) => (Some(t), OffsetSource::Table, detail),
+        None => {
+            detail.push("no table offset for this build".to_string());
+            (None, OffsetSource::None, detail)
+        }
+    }
+}
+
 /// Installs all hooks once. Later calls (e.g. after the service restarts while
 /// the DLL stays injected) return the report from the first installation.
 fn install_hooks(
@@ -286,37 +323,9 @@ fn install_hooks(
 
     // ---- chat_recv: dynamic lookup first, table as fallback ----
     {
-        let table_rva = offsets.get(names::CHAT_RECV).copied();
-        let mut rva = None;
-        let mut source = OffsetSource::None;
-        let mut detail: Vec<String> = Vec::new();
-
-        if dynamic_lookup {
-            match unsafe { sigscan::find_chat_recv(base_address as usize) } {
-                Ok(hit) => {
-                    rva = Some(hit.rva as u64);
-                    source = OffsetSource::Dynamic;
-                    detail.push(format!("scan: {}", hit.detail));
-                    if let Some(t) = table_rva {
-                        if t != hit.rva as u64 {
-                            detail.push(format!(
-                                "table offset 0x{:x} differs from scan result 0x{:x}; using scan",
-                                t, hit.rva
-                            ));
-                        }
-                    }
-                }
-                Err(e) => detail.push(format!("scan failed: {}", e)),
-            }
-        }
-        if rva.is_none() {
-            if let Some(t) = table_rva {
-                rva = Some(t);
-                source = OffsetSource::Table;
-            } else {
-                detail.push("no table offset for this build".to_string());
-            }
-        }
+        let (rva, source, mut detail) = resolve_rva(offsets, names::CHAT_RECV, dynamic_lookup, || unsafe {
+            sigscan::find_chat_recv(base_address as usize)
+        });
 
         let installed = match rva {
             Some(r) => match chat_message::begin_detour(base_address as usize + r as usize) {
@@ -363,25 +372,30 @@ fn install_hooks(
         });
     }
 
-    // ---- cmd_dispatch: table only, with optional global chain ----
+    // ---- cmd_dispatch + its global pointer chain: dynamic lookup first, table as fallback ----
     {
-        let rva = offsets.get(names::CMD_DISPATCH).copied();
-        let chain = match (
+        let (rva, source, mut detail) = resolve_rva(offsets, names::CMD_DISPATCH, dynamic_lookup, || unsafe {
+            sigscan::find_cmd_dispatch(base_address as usize)
+        });
+        let mut chain = cmd_dispatch::ChainSource::None;
+        if dynamic_lookup {
+            match unsafe { sigscan::find_chain_vtables(base_address as usize) } {
+                Ok(vtables) => chain = cmd_dispatch::ChainSource::Rtti(vtables),
+                Err(e) => detail.push(format!("chain vtable scan failed: {}", e)),
+            }
+        }
+        if let (cmd_dispatch::ChainSource::None, Some(g), Some(c), Some(m)) = (
+            &chain,
             offsets.get(names::GLOBAL_PTR),
             offsets.get(names::CONTEXT_VTABLE),
             offsets.get(names::MANAGER_VTABLE),
         ) {
-            (Some(g), Some(c), Some(m)) => Some(cmd_dispatch::GlobalChain {
+            chain = cmd_dispatch::ChainSource::Table(cmd_dispatch::GlobalChain {
                 global_ptr: *g as usize,
                 context_vtable: *c as usize,
                 manager_vtable: *m as usize,
-            }),
-            _ => None,
-        };
-        let mut detail = vec![format!(
-            "global chain {}",
-            if chain.is_some() { "from table" } else { "unavailable" }
-        )];
+            });
+        }
         let installed = match rva {
             Some(r) => match cmd_dispatch::begin_detour(base_address, r, chain) {
                 Ok(()) => true,
@@ -390,15 +404,13 @@ fn install_hooks(
                     false
                 }
             },
-            None => {
-                detail.push("no table offset for this build".to_string());
-                false
-            }
+            None => false,
         };
+        detail.push(cmd_dispatch::chain_status());
         report.hooks.push(HookStatus {
             name: names::CMD_DISPATCH.to_string(),
             rva,
-            source: if rva.is_some() { OffsetSource::Table } else { OffsetSource::None },
+            source,
             installed,
             detail: Some(detail.join("; ")),
         });
